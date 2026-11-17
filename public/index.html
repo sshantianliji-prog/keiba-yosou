@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#f5f5f7">
+  <meta name="robots" content="noindex, nofollow">
+  <title>競馬予想</title>
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div class="ambient" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <filter id="liquid" x="0" y="0" width="100%" height="100%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.008 0.012" numOctaves="2" seed="7" result="n"/>
+      <feGaussianBlur in="n" stdDeviation="2" result="b"/>
+      <feDisplacementMap in="SourceGraphic" in2="b" scale="18" xChannelSelector="R" yChannelSelector="G"/>
+    </filter>
+  </svg>
+
+  <div id="skeleton" class="skeleton-screen" aria-busy="true" aria-label="読み込み中" data-testid="skeleton">
+    <div class="sk-head"><span class="sk sk-title"></span><span class="sk sk-circle"></span></div>
+    <div class="sk-body"></div>
+    <div class="sk-tabbar"><span class="sk sk-pill"></span><span class="sk sk-pill"></span><span class="sk sk-pill"></span></div>
+  </div>
+
+  <main id="app" tabindex="-1"></main>
+  <nav id="tabbar" class="tabbar glass" hidden aria-label="メイン">
+    <span class="tab-thumb"></span>
+    <a href="#/" data-tab="races" data-testid="tab-races">
+      <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg><span>レース</span></a>
+    <a href="#/stats" data-tab="stats" data-testid="tab-stats">
+      <svg viewBox="0 0 24 24"><path d="M5 20V11M12 20V5M19 20v-6"/></svg><span>成績</span></a>
+    <a href="#/rules" data-tab="rules" data-testid="tab-rules">
+      <svg viewBox="0 0 24 24"><path d="M7 3h7l5 5v13H7z"/><path d="M14 3v5h5M10 13h6M10 17h6"/></svg><span>ルール</span></a>
+  </nav>
+  <div id="toasts" aria-live="polite"></div>
+  <div id="sheet-root"></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

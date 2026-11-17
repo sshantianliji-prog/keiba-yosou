@@ -1,0 +1,20 @@
+{
+  "name": "keiba-yosou",
+  "version": "1.0.0",
+  "description": "",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node tests/bets.test.mjs",
+    "test:e2e": "playwright test"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "devDependencies": {
+    "@playwright/test": "^1.65.1",
+    "wrangler": "^4.164.0"
+  },
+  "private": true
+}
