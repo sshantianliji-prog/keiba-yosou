@@ -11,10 +11,10 @@
   },
   "ai": { "binding": "AI" },
   "d1_databases": [
-    { "binding": "DB", "database_name": "keiba-yosou", "database_id": "REPLACE_D1_ID" }
+    { "binding": "DB", "database_name": "keiba-yosou", "database_id": "b89e5162-f8c9-4545-8885-d8c11dea8660" }
   ],
   "kv_namespaces": [
-    { "binding": "IMAGES", "id": "REPLACE_KV_ID" }
+    { "binding": "IMAGES", "id": "12c695b41b3d437f89b4447390f733a0" }
   ],
   "observability": { "enabled": true }
 }

@@ -305,7 +305,7 @@ async function viewRace(id) {
     <div id="panel" style="margin-top:16px"></div>
   `, () => {
     $$('[data-step]', app).forEach((b) => b.addEventListener('click', () => goStep(b.dataset.step)));
-    $('[data-act="del"]', app).addEventListener('click', () => confirmDelete(race));
+    $$('[data-act="del"]', app).forEach((b) => b.addEventListener('click', () => confirmDelete(race)));
     goStep(state.step, true);
     addEventListener('resize', moveThumb);
   });
