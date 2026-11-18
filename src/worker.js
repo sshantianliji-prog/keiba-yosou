@@ -1,4 +1,4 @@
-import { chatJSON } from './ai.js';
+import { chatJSON, FAST_MODEL } from './ai.js';
 import { BET_TYPES, buildBets, settle, comboKey, judge } from './bets.js';
 import { DEFAULT_RULES, VIEWPOINTS, VIEWPOINT_DESC } from './rules.js';
 import { fetchSource, courseUrl } from './research.js';
@@ -152,18 +152,31 @@ async function readRace(env, race, { text }) {
   const parts = [];
   const errors = [];
   const hint = `参考：このレースは ${race.date} ${race.course} ${race.rnum}R です。`;
+  const jobs = [];
   if (text && text.trim()) {
-    parts.push(await chatJSON(env, { system: READ_SYSTEM, user: `${hint}\n次はJRAサイトの出馬表からコピーしたテキストです。\n\n${text.slice(0, 30000)}`, maxTokens: 8000 }));
-  }
-  for (const img of race.images) {
-    const dataUrl = await env.IMAGES.get(img.key);
-    if (!dataUrl) continue;
-    try {
-      parts.push(await chatJSON(env, { system: READ_SYSTEM, user: `${hint}\nこの画像に写っている全馬を書き写してください。`, images: [dataUrl], maxTokens: 8000 }));
-    } catch (e) {
-      errors.push(`${img.name}：${e.message}`);
+    // 馬番の範囲ごとに並列で読み取り、応答を短くして待ち時間を減らす
+    const ranges = [[1, 5], [6, 10], [11, 14], [15, 18]];
+    for (const [a, b] of ranges) {
+      jobs.push(
+        chatJSON(env, {
+          system: READ_SYSTEM,
+          user: `${hint}\n次はJRAサイトの出馬表からコピーしたテキストです。このうち馬番 ${a}〜${b} の馬だけを書き写してください（該当する馬がいなければ horses は空配列）。race は毎回すべて埋めてください。\n\n${text.slice(0, 30000)}`,
+          maxTokens: 4000,
+          model: env.READ_MODEL || FAST_MODEL,
+        }).catch((e) => { errors.push(`テキスト（馬番${a}〜${b}）：${e.message}`); return null; })
+      );
     }
   }
+  for (const img of race.images) {
+    jobs.push(
+      env.IMAGES.get(img.key).then((dataUrl) =>
+        dataUrl
+          ? chatJSON(env, { system: READ_SYSTEM, user: `${hint}\nこの画像に写っている全馬を書き写してください。`, images: [dataUrl], maxTokens: 8000 })
+          : null
+      ).catch((e) => { errors.push(`${img.name}：${e.message}`); return null; })
+    );
+  }
+  parts.push(...(await Promise.all(jobs)).filter(Boolean));
   if (!parts.length) throw new Error(errors[0] || '読み取る画像またはテキストがありません');
   const prev = race.horses;
   const result = mergeRead(prev ? [prev, ...parts] : parts);
@@ -200,7 +213,10 @@ ${usable.map((s, i) => `[${i + 1}] ${s.title || ''} ${s.url}\n${s.text}`).join('
     summary = null;
   }
   const blank = ['取得できず'];
-  const sec = (k) => (Array.isArray(summary?.[k]) && summary[k].length ? summary[k].map(String) : blank);
+  const sec = (k) => {
+    const v = (Array.isArray(summary?.[k]) ? summary[k] : []).map(String).filter((x) => !/^取得できず/.test(x));
+    return v.length ? v : blank;
+  };
   return {
     grade,
     sections: {
@@ -286,6 +302,18 @@ ${evalList.map((e) => `${e.馬番}番 ${e.馬名}（${e.人気 ?? '?'}人気・$
   const ok = (n) => valid.has(Number(n));
   const marks = (s.印 || []).filter((m) => ok(m.馬番) && '◎○▲△☆'.includes(m.印)).map((m) => ({ ...m, 馬番: Number(m.馬番) }));
   const rankByScore = [...evalList].sort((a, b) => b.総合 - a.総合).map((e) => e.馬番);
+  // 印が足りないときは総合評価の順に補う（◎○▲は1頭ずつ、△は最大2頭）
+  const want = ['◎', '○', '▲', '△', '△'].slice(0, Math.max(1, Math.min(5, data.horses.length - 1)));
+  for (const sym of want) {
+    const have = marks.filter((m) => m.印 === sym).length;
+    const need = want.filter((x) => x === sym).length;
+    if (have >= need) continue;
+    const n = rankByScore.find((no) => !marks.some((m) => m.馬番 === no));
+    if (n == null) break;
+    const e = evalList.find((x) => x.馬番 === n);
+    const good = e.観点.filter((x) => x.印 === '◎' || x.印 === '○').map((x) => x.観点);
+    marks.push({ 馬番: n, 印: sym, 根拠: `総合評価${e.総合}。${good.length ? `${good.join('・')}で高評価。` : ''}${e.一言 || ''}` });
+  }
   const honmei = marks.find((m) => m.印 === '◎')?.馬番 || rankByScore[0];
   const markOrder = ['◎', '○', '▲', '△', '☆'];
   const byMarks = [...marks].sort((a, b) => markOrder.indexOf(a.印) - markOrder.indexOf(b.印)).map((m) => m.馬番);

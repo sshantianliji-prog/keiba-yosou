@@ -1,7 +1,8 @@
 // Workers AI 呼び出しと JSON 取り出し
 
-export const VISION_MODEL = '@cf/meta/llama-4-scout-17b-16e-instruct';
-export const TEXT_MODEL = '@cf/meta/llama-4-scout-17b-16e-instruct';
+export const VISION_MODEL = '@cf/mistralai/mistral-small-3.1-24b-instruct';
+export const TEXT_MODEL = '@cf/openai/gpt-oss-120b';
+export const FAST_MODEL = '@cf/openai/gpt-oss-20b';
 
 export function parseJSON(text) {
   if (text && typeof text === 'object') return text;
@@ -31,8 +32,8 @@ function extract(res) {
   if (res.choices?.[0]?.message?.content !== undefined) return res.choices[0].message.content;
   if (Array.isArray(res.output)) {
     const msg = res.output.find((o) => o.type === 'message');
-    const txt = msg?.content?.find((c) => c.type === 'output_text');
-    if (txt) return txt.text;
+    const txt = msg?.content?.find((c) => c.type === 'output_text') || msg?.content?.[0];
+    if (txt?.text) return txt.text;
   }
   return res;
 }
@@ -49,7 +50,10 @@ export async function chatJSON(env, { system, user, images = [], maxTokens = 409
   let lastErr;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const res = await env.AI.run(m, { messages, max_tokens: maxTokens, temperature: attempt ? 0.1 : 0.3 });
+      const input = m.includes('gpt-oss')
+        ? { input: messages, reasoning: { effort: 'low' }, max_output_tokens: maxTokens + 2000 }
+        : { messages, max_tokens: maxTokens, temperature: attempt ? 0.1 : 0.3 };
+      const res = await env.AI.run(m, input);
       return parseJSON(extract(res));
     } catch (e) {
       lastErr = e;
