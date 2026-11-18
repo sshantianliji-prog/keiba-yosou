@@ -168,15 +168,15 @@ export async function readRace(env, race, { text }) {
   const jobs = [];
   if (text && text.trim()) {
     // 馬番の範囲ごとに並列で読み取り、応答を短くして待ち時間を減らす
-    const ranges = [[1, 5], [6, 10], [11, 14], [15, 18]];
+    const ranges = [[1, 9], [10, 18]];
     for (const [a, b] of ranges) {
       jobs.push(
         chatJSON(env, {
           system: READ_SYSTEM,
           user: `${hint}\n次はJRAサイトの出馬表からコピーしたテキストです。このうち馬番 ${a}〜${b} の馬だけを書き写してください（該当する馬がいなければ horses は空配列）。race は毎回すべて埋めてください。\n\n${text.slice(0, 30000)}`,
-          maxTokens: 4000,
+          maxTokens: 6000,
           model: env.READ_MODEL || FAST_MODEL,
-        }).catch((e) => { errors.push(`テキスト（馬番${a}〜${b}）：${e.message}`); return null; })
+        }).catch((e) => { if (/無料枠/.test(e.message)) throw e; errors.push(`テキスト（馬番${a}〜${b}）：${e.message}`); return null; })
       );
     }
   }
@@ -186,7 +186,7 @@ export async function readRace(env, race, { text }) {
         dataUrl
           ? chatJSON(env, { system: READ_SYSTEM, user: `${hint}\nこの画像に写っている全馬を書き写してください。`, images: [dataUrl], maxTokens: 8000 })
           : null
-      ).catch((e) => { errors.push(`${img.name}：${e.message}`); return null; })
+      ).catch((e) => { if (/無料枠/.test(e.message)) throw e; errors.push(`${img.name}：${e.message}`); return null; })
     );
   }
   parts.push(...(await Promise.all(jobs)).filter(Boolean));

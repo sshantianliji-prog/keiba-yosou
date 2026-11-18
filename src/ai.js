@@ -57,6 +57,9 @@ export async function chatJSON(env, { system, user, images = [], maxTokens = 409
       return parseJSON(extract(res));
     } catch (e) {
       lastErr = e;
+      if (/4006|daily free allocation|neurons/i.test(String(e?.message || e))) {
+        throw new Error('本日のAI無料枠（Workers AI）を使い切りました。日本時間の朝9時に回復しますので、その後にもう一度お試しください。');
+      }
     }
   }
   throw new Error(`AIの処理に失敗しました：${lastErr?.message || lastErr}`);
