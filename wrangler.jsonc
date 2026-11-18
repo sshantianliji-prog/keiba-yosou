@@ -16,5 +16,12 @@
   "kv_namespaces": [
     { "binding": "IMAGES", "id": "12c695b41b3d437f89b4447390f733a0" }
   ],
+  "workflows": [
+    { "name": "keiba-yosou-flow", "binding": "FLOW", "class_name": "YosouFlow" }
+  ],
+  "vars": {
+    "VAPID_PUBLIC": "BEO42GzQ8QMj6wnIf3HlD2R5kfA4LTTunxY343YfSF-bJCoHyuFGkulNYxuMhBTvK4fZjZto07fam9Ji0ClN9pU",
+    "VAPID_SUBJECT": "https://keiba-yosou.comuscle-survey.workers.dev"
+  },
   "observability": { "enabled": true }
 }

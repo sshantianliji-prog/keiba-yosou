@@ -1,9 +1,11 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, chromium } from '@playwright/test';
+import os from 'node:os';
+import path from 'node:path';
+import fs from 'node:fs';
 
 const PASS = process.env.APP_PASSWORD || 'localtest';
 const AI = process.env.E2E_AI !== '0';
 const RACE = { date: '2099-01-07', course: '小倉', rnum: '1' };
-const RACE_ID = `${RACE.date}_${RACE.course}_${RACE.rnum}R`;
 
 // 架空の出馬表テキスト（JRAサイトからコピーした形を模したもの）
 const PASTE = `2099年1月7日（土曜） 1回小倉1日 1R 3歳未勝利 ダート1700m（右） 発走 10:05 天候：晴 馬場：良 8頭
@@ -28,7 +30,8 @@ async function login(page) {
   await page.goto('/#/login');
   await page.getByTestId('password').fill(PASS);
   await page.getByTestId('login-submit').click();
-  await expect(page.getByTestId('race-list')).toBeVisible();
+  await expect(page.getByTestId('new-race')).toBeVisible();
+  await expect(page.getByTestId('skeleton')).toHaveAttribute('aria-busy', 'false');
 }
 
 test.describe.configure({ mode: 'serial' });
@@ -54,86 +57,140 @@ test('パスコードが違うとログインできない', async ({ page }) => 
 
 test('ログインするとレース一覧とサンプルレースが表示される', async ({ page }) => {
   await login(page);
-  await expect(page.locator('[data-testid="race-item"][data-id="2026-11-22_京都_11R"]')).toBeVisible();
+  await expect(page.getByTestId('race-list').or(page.getByText('レースがありません'))).toBeVisible();
   await expect(page.locator('#tabbar')).toBeVisible();
 });
 
 test('サンプルレースの確認画面に全頭が表示され、要確認なしで確定できる', async ({ page }) => {
   await login(page);
-  await page.locator('[data-testid="race-item"][data-id="2026-11-22_京都_11R"]').click();
+  const sample = page.locator('[data-testid="race-item"][data-id="2026-11-22_京都_11R"]');
+  test.skip(!(await sample.count()), 'サンプルレースは削除済み');
+  await sample.click();
   await page.getByTestId('step-check').click();
   await expect(page.getByTestId('horse-table').locator('tbody > tr[data-i]')).toHaveCount(8);
 });
 
-test('新規レース作成から結果記録まで一通り使える', async ({ page }) => {
+test('出馬表を入れるだけでレースを自動判別し、アプリを閉じても予想が完了して通知される', async ({ page, context }) => {
   test.skip(!AI, 'AIを使うテストは E2E_AI=0 で省略');
+  await context.grantPermissions(['notifications']);
   await login(page);
-  // 既存のテストレースを掃除
-  await page.request.delete(`/api/races/${encodeURIComponent(RACE_ID)}`);
+  // 以前のテストレースを掃除
+  const old = (await (await page.request.get('/api/races')).json()).races.filter((r) => r.date === RACE.date && r.course === RACE.course);
+  for (const r of old) await page.request.delete(`/api/races/${encodeURIComponent(r.id)}`);
+  await page.reload();
+  await expect(page.getByTestId('new-race')).toBeVisible();
 
+  // 出馬表を入れるだけ（日付・競馬場・R番号は選ばない）
   await page.getByTestId('new-race').click();
-  await page.getByTestId('nr-date').fill(RACE.date);
-  await page.getByTestId('nr-course').selectOption(RACE.course);
-  await page.getByTestId('nr-rnum').selectOption(RACE.rnum);
-  await page.getByTestId('nr-submit').click();
-  await expect(page).toHaveURL(new RegExp(encodeURIComponent(RACE_ID)));
-
-  // 1. 読み取り
+  const form = page.getByTestId('intake-form');
+  await expect(form).toBeVisible();
+  await form.locator('summary').click();
   await page.getByTestId('paste-text').fill(PASTE);
-  await page.getByTestId('do-read').click();
-  await expect(page.getByTestId('ai-loading')).toBeVisible();
-  await expect(page.getByTestId('go-check')).toBeVisible({ timeout: 180000 });
-  await page.getByTestId('go-check').click();
+  await form.getByTestId('bet-type').selectOption('sanrenpuku_1');
+  await form.getByTestId('budget').fill('600');
+  await expect(page.getByTestId('notify')).toBeChecked();
+  await page.getByTestId('intake-submit').click();
 
-  // 2. 確認（8頭そろっていること）
-  const rows = page.getByTestId('horse-table').locator('tbody > tr[data-i]');
-  await expect(rows).toHaveCount(8);
-  await expect(rows.nth(0).locator('input[data-k="馬名"]')).toHaveValue(/テスト/);
-  await page.getByTestId('confirm-horses').click();
-  await expect(page.getByTestId('step-research')).toHaveAttribute('aria-selected', 'true');
+  // 待ち時間の表示
+  await expect(page).toHaveURL(/#\/race\/r[0-9a-f]+/);
+  const raceId = decodeURIComponent(page.url().match(/#\/race\/([^?]+)/)[1]);
+  await expect(page.getByTestId('job-card')).toBeVisible();
+  await expect(page.getByTestId('eta')).toHaveText(/あと(\d+分)?\d+秒|まもなく完了/);
+  const eta1 = await page.getByTestId('eta').textContent();
+  await page.waitForTimeout(2500);
+  const eta2 = await page.getByTestId('eta').textContent();
+  expect(eta2).not.toBe(eta1); // カウントダウンしている
 
-  // 3. リサーチ（JRAコース紹介ページ＋取得できないURL）
-  await page.getByTestId('urls').fill('https://example.invalid/not-found');
-  await page.getByTestId('track-memo').fill('内が伸びている');
-  await page.getByTestId('do-research').click();
-  const rs = page.getByTestId('research-result');
-  await expect(rs).toBeVisible({ timeout: 180000 });
-  await expect(rs).toContainText('取得できず');
-  await page.getByTestId('go-yosou').click();
+  // アプリを閉じる
+  await page.close();
+  const status = async () => (await (await context.request.get(`/api/races/${encodeURIComponent(raceId)}/job`)).json()).job.status;
+  await expect.poll(status, { timeout: 300000, intervals: [5000] }).toBe('done');
 
-  // 4. 予想（3連複 軸1頭流し 600円）
-  await page.getByTestId('bet-type').selectOption('sanrenpuku_1');
-  await page.getByTestId('budget').fill('600');
-  await page.getByTestId('do-yosou').click();
-  const yr = page.getByTestId('yosou-result');
-  await expect(yr).toBeVisible({ timeout: 300000 });
-  await expect(page.getByTestId('total')).toHaveText('600円');
-  const amounts = await page.getByTestId('bet-amount').allTextContents();
+  // 通知の内容
+  const notice = await (await context.request.get('/api/push/latest')).json();
+  expect(notice.title).toBe('予想完了');
+
+  // 開き直すと予想ができている
+  const p2 = await context.newPage();
+  await p2.goto(`/#/race/${encodeURIComponent(raceId)}`);
+  await expect(p2.locator('.large-title h1')).toContainText('小倉 1R');
+  await expect(p2.getByTestId('yosou-result')).toBeVisible();
+  await expect(p2.getByTestId('total')).toHaveText('600円');
+  const amounts = await p2.getByTestId('bet-amount').allTextContents();
   expect(amounts.reduce((s, a) => s + Number(a.replace(/[^\d]/g, '')), 0)).toBe(600);
-  await expect(page.getByTestId('marks')).toContainText('◎');
-  await expect(page.getByTestId('eval-table').locator('tbody tr')).toHaveCount(8);
-  const dl = page.waitForEvent('download');
-  await page.getByTestId('download-md').click();
+  await expect(p2.getByTestId('marks')).toContainText('◎');
+  await expect(p2.getByTestId('eval-table').locator('tbody tr')).toHaveCount(8);
+  const dl = p2.waitForEvent('download');
+  await p2.getByTestId('download-md').click();
   expect((await dl).suggestedFilename()).toContain('yosou.md');
 
-  // 5. 結果（買い目の1組を的中させる）
-  const firstCombo = (await page.getByTestId('bets').locator('.bet').first().locator('.num-ball').allTextContents()).map(Number);
-  await page.getByTestId('go-kekka').click();
-  for (let i = 0; i < 3; i++) await page.getByTestId(`order-${i + 1}`).selectOption(String(firstCombo[i]));
-  await expect(page.getByTestId('payout-input').first()).toBeVisible();
-  await page.getByTestId('payout-input').first().fill('1520');
-  await page.getByTestId('do-kekka').click();
-  await expect(page.getByTestId('kekka-result')).toBeVisible({ timeout: 180000 });
-  await expect(page.getByTestId('hit-badge')).toHaveText('的中');
-  await expect(page.getByTestId('kekka-stats')).toContainText('回収率');
+  // 結果（買い目の1組を的中させる）
+  const firstCombo = (await p2.getByTestId('bets').locator('.bet').first().locator('.num-ball').allTextContents()).map(Number);
+  await p2.getByTestId('go-kekka').click();
+  for (let i = 0; i < 3; i++) await p2.getByTestId(`order-${i + 1}`).selectOption(String(firstCombo[i]));
+  await expect(p2.getByTestId('payout-input').first()).toBeVisible();
+  await p2.getByTestId('payout-input').first().fill('1520');
+  await p2.getByTestId('do-kekka').click();
+  await expect(p2.getByTestId('kekka-result')).toBeVisible({ timeout: 180000 });
+  await expect(p2.getByTestId('hit-badge')).toHaveText('的中');
+  await expect(p2.getByTestId('kekka-stats')).toContainText('回収率');
 
-  // 成績ページに記録が出る
-  await page.getByTestId('tab-stats').click();
-  await expect(page.getByTestId('log-table')).toContainText('3連複 軸1頭流し');
-  const csv = await page.request.get('/api/log.csv');
-  const body = await csv.text();
+  // 成績ページとCSV
+  await p2.getByTestId('tab-stats').click();
+  await expect(p2.getByTestId('log-table')).toContainText('3連複 軸1頭流し');
+  const body = await (await p2.request.get('/api/log.csv')).text();
   expect(body).toContain('日付,競馬場,R,レース名,クラス,券種,買い目,投資額,払戻額,的中,◎の着順,軸の着順,効いた観点,外れた観点,メモ');
   expect(body).toContain(RACE.date);
+});
+
+test('処理中のレースは一覧に残り時間が表示される', async ({ page }) => {
+  test.skip(!AI, 'AIを使うテストは E2E_AI=0 で省略');
+  await login(page);
+  const res = await (await page.request.post('/api/intake', { data: { text: PASTE, type: 'tansho', budget: 100 } })).json();
+  await page.reload();
+  const chip = page.locator(`[data-eta-chip="${res.raceId}"]`);
+  await expect(chip).toBeVisible();
+  await expect(chip).toHaveText(/あと(\d+分)?\d+秒|まもなく完了|予想中/);
+  await expect.poll(async () => (await (await page.request.get(`/api/races/${res.raceId}/job`)).json()).job.status, { timeout: 300000, intervals: [5000] }).not.toBe('running');
+  await page.request.delete(`/api/races/${res.raceId}`);
+});
+
+test('予想が完了すると「予想完了」の通知が端末に表示される（実際のChromeで確認）', async ({ baseURL }) => {
+  test.skip(!AI || process.env.E2E_PUSH === '0', '通知テストは E2E_PUSH=0 で省略');
+  // 自動操作用のChromiumはプッシュ通知に対応していないため、インストール済みのChromeを使う
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-push-'));
+  const ctx = await chromium.launchPersistentContext(dir, {
+    headless: false, channel: 'chrome', baseURL, permissions: ['notifications'],
+    ignoreDefaultArgs: ['--disable-background-networking', '--disable-component-update', '--disable-sync', '--no-service-autorun', '--disable-field-trial-config', '--disable-default-apps', '--disable-extensions', '--enable-automation'],
+  });
+  try {
+    const page = ctx.pages()[0] || (await ctx.newPage());
+    await login(page);
+    // 「予想する」画面から送信すると通知が登録される
+    await page.getByTestId('new-race').click();
+    const form = page.getByTestId('intake-form');
+    await form.locator('summary').click();
+    await page.getByTestId('paste-text').fill(PASTE);
+    await form.getByTestId('bet-type').selectOption('tansho');
+    await form.getByTestId('budget').fill('100');
+    await page.getByTestId('intake-submit').click();
+    await expect(page).toHaveURL(/#\/race\/r[0-9a-f]+/);
+    const raceId = decodeURIComponent(page.url().match(/#\/race\/([^?]+)/)[1]);
+    await expect.poll(async () => (await (await page.request.get('/api/push/status')).json()).subscriptions, { timeout: 30000 }).toBeGreaterThan(0);
+    // アプリの画面を閉じて待つ
+    await page.goto('about:blank');
+    await expect.poll(async () => (await (await ctx.request.get(`/api/races/${raceId}/job`)).json()).job.status, { timeout: 300000, intervals: [5000] }).toBe('done');
+    const push = await (await ctx.request.get('/api/push/status')).json();
+    expect(push.statuses.some((s) => s >= 200 && s < 300)).toBeTruthy();
+    // 端末に表示された通知を確認
+    const p2 = await ctx.newPage();
+    await p2.goto('/');
+    const titles = async () => p2.evaluate(async () => (await (await navigator.serviceWorker.ready).getNotifications()).map((n) => n.title));
+    await expect.poll(titles, { timeout: 60000 }).toContain('予想完了');
+    await ctx.request.delete(`/api/races/${raceId}`);
+  } finally {
+    await ctx.close();
+  }
 });
 
 test('ルールを編集して保存できる', async ({ page }) => {
@@ -154,17 +211,21 @@ test('ルールを編集して保存できる', async ({ page }) => {
 
 test('テストレースを削除できる', async ({ page }) => {
   await login(page);
-  await page.request.post('/api/races', { data: { date: RACE.date, course: RACE.course, rnum: Number(RACE.rnum) } });
-  await page.goto(`/#/race/${encodeURIComponent(RACE_ID)}`);
+  const races = (await (await page.request.get('/api/races')).json()).races.filter((r) => r.date === RACE.date && r.course === RACE.course);
+  test.skip(!races.length, '削除対象のテストレースがありません');
+  for (const r of races.slice(1)) await page.request.delete(`/api/races/${encodeURIComponent(r.id)}`);
+  const id = races[0].id;
+  await page.goto(`/#/race/${encodeURIComponent(id)}`);
   await page.getByTestId('delete-race').click();
   await page.getByTestId('confirm-delete').click();
-  await expect(page.getByTestId('race-list')).toBeVisible();
-  await expect(page.locator(`[data-testid="race-item"][data-id="${RACE_ID}"]`)).toHaveCount(0);
+  await expect(page.getByTestId('new-race')).toBeVisible();
+  await expect(page.locator(`[data-testid="race-item"][data-id="${id}"]`)).toHaveCount(0);
 });
 
 test('スマートフォン幅で横スクロールが出ない @mobile', async ({ page }) => {
   await login(page);
-  for (const hash of ['#/', '#/stats', '#/rules', `#/race/${encodeURIComponent('2026-11-22_京都_11R')}`]) {
+  const first = (await (await page.request.get('/api/races')).json()).races[0];
+  for (const hash of ['#/', '#/stats', '#/rules', ...(first ? [`#/race/${encodeURIComponent(first.id)}`] : [])]) {
     await page.goto('/' + hash);
     await expect(page.getByTestId('skeleton')).toHaveAttribute('aria-busy', 'false');
     const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);

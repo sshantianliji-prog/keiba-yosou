@@ -14,6 +14,7 @@
 - `src/bets.js` … 買い目の組み立て、予算ちょうどの金額配分、的中判定
 - `src/rules.js` … 既定の予想観点とルール（アプリの「ルール」画面で編集可、D1 の settings に保存）
 - `src/research.js` … 公開ページ1件の取得と本文抽出
+- `src/flow.js` … Cloudflare Workflows による読み取り→リサーチ→予想のバックグラウンド処理、残り時間の見積もり、Web Push 通知（本文なしのプッシュ＋SW から最新通知を取得）
 - `public/` … フロントエンド（リキッドグラス UI、フレームワークなし）
 - `schema.sql` … D1 のテーブル
 - `tests/` … `npm test`（買い目計算）、`npm run test:e2e`（Playwright によるブラウザ操作テスト）
@@ -21,4 +22,5 @@
 ## 開発
 - ローカル：`.dev.vars` に `APP_PASSWORD=...` を書き、`npx wrangler dev`
 - デプロイ：`npx wrangler deploy`、パスコードは `npx wrangler secret put APP_PASSWORD`
+- 通知の秘密鍵は `VAPID_PRIVATE_JWK`（secret）、公開鍵は wrangler.jsonc の `VAPID_PUBLIC`
 - E2E：`BASE_URL=https://... APP_PASSWORD=... npm run test:e2e`（AIを使うテストを省くときは `E2E_AI=0`）

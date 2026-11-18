@@ -1,4 +1,6 @@
 import { chatJSON, FAST_MODEL } from './ai.js';
+import { YosouFlow, startJob, jobStatus, activeJobs, pushPublicKey, saveSubscription, latestNotice } from './flow.js';
+export { YosouFlow };
 import { BET_TYPES, buildBets, settle, comboKey, judge } from './bets.js';
 import { DEFAULT_RULES, VIEWPOINTS, VIEWPOINT_DESC } from './rules.js';
 import { fetchSource, courseUrl } from './research.js';
@@ -56,7 +58,7 @@ async function ensureSample(env) {
   ]);
 }
 
-async function loadRace(env, id) {
+export async function loadRace(env, id) {
   const r = await env.DB.prepare('SELECT * FROM races WHERE id = ?').bind(id).first();
   if (!r) return null;
   return {
@@ -69,7 +71,7 @@ async function loadRace(env, id) {
   };
 }
 
-async function saveRace(env, id, fields) {
+export async function saveRace(env, id, fields) {
   const keys = Object.keys(fields);
   const vals = keys.map((k) => (typeof fields[k] === 'object' && fields[k] !== null ? JSON.stringify(fields[k]) : fields[k]));
   await env.DB.prepare(`UPDATE races SET ${keys.map((k) => `${k} = ?`).join(', ')}, updated_at = ? WHERE id = ?`)
@@ -78,12 +80,20 @@ async function saveRace(env, id, fields) {
 }
 
 // ---------- 読み取り ----------
+const COURSES = ['札幌', '函館', '福島', '新潟', '東京', '中山', '中京', '京都', '阪神', '小倉'];
+export function raceKey(info = {}) {
+  const m = String(info.日付 || '').match(/(\d{4})\D+(\d{1,2})\D+(\d{1,2})/);
+  const date = m ? `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}` : '';
+  const course = COURSES.find((c) => String(info.競馬場 || '').includes(c)) || '';
+  const r = parseInt(String(info.R番号 ?? '').replace(/[^\d]/g, ''), 10);
+  return { date, course, rnum: r >= 1 && r <= 12 ? r : 0 };
+}
 const READ_SYSTEM = `あなたはJRA公式サイトの出馬表（馬柱）を書き写す担当です。
 写っている情報だけを正確に書き写してください。推測で値を埋めてはいけません。
 読めない・自信がない値は null にするか読めた値を入れたうえで、その馬に "要確認": true を付け、"要確認項目" に項目名を入れてください。
 出力は次の形のJSONのみで、説明文は書かないでください。
 {
- "race": {"日付":"YYYY-MM-DD","競馬場":"京都","R番号":11,"レース名":"","クラス":"GⅠ/GⅡ/GⅢ/リステッド/オープン/3勝クラス/2勝クラス/1勝クラス/未勝利/新馬","芝ダ":"芝|ダート|障害","距離":2000,"回り":"内回り|外回り|なし","頭数":18,"発走時刻":"15:40","馬場状態":"良|稍重|重|不良"},
+ "race": {"日付":"YYYY-MM-DD","競馬場":"京都","R番号":11,"レース名":"ジャパンカップ や 3歳未勝利 など（開催回日は含めない）","クラス":"GⅠ/GⅡ/GⅢ/リステッド/オープン/3勝クラス/2勝クラス/1勝クラス/未勝利/新馬","芝ダ":"芝|ダート|障害","距離":2000,"回り":"内回り|外回り|なし","頭数":18,"発走時刻":"15:40","馬場状態":"良|稍重|重|不良"},
  "horses": [
   {"枠番":1,"馬番":1,"馬名":"","性齢":"牡4","斤量":58.0,"騎手":"","調教師":"","単勝オッズ":3.5,"人気":1,"馬体重":480,"増減":-2,"戦績":"5-2-1-3",
    "近走":[{"日付":"2026-10-12","競馬場":"東京","レース名":"","クラス":"GⅡ","距離":"芝1800","馬場":"良","頭数":12,"人気":2,"着順":1,"タイム":"1:45.2","通過順":"3-3-2","上がり3F":33.8,"着差":"0.2","相手":"相手の馬名"}],
@@ -148,10 +158,13 @@ export function validate(data) {
   return { race, horses, missing, needsCheck: horses.filter((h) => h.要確認).map((h) => h.馬番) };
 }
 
-async function readRace(env, race, { text }) {
+export async function readRace(env, race, { text }) {
   const parts = [];
   const errors = [];
-  const hint = `参考：このレースは ${race.date} ${race.course} ${race.rnum}R です。`;
+  const today = new Date(Date.now() + 9 * 3600e3).toISOString().slice(0, 10);
+  const hint = race.date && race.course
+    ? `参考：このレースは ${race.date} ${race.course} ${race.rnum}R です。`
+    : `参考：今日の日付は ${today} です。出馬表に年が書かれていなければ、今日に最も近い年と判断してください。日付・競馬場・R番号は必ず読み取ってください。`;
   const jobs = [];
   if (text && text.trim()) {
     // 馬番の範囲ごとに並列で読み取り、応答を短くして待ち時間を減らす
@@ -187,7 +200,7 @@ async function readRace(env, race, { text }) {
 // ---------- リサーチ ----------
 const isGrade = (cls) => /G|重賞|Ｇ/.test(cls || '');
 
-async function doResearch(env, race, { urls = [], memo = '' }) {
+export async function doResearch(env, race, { urls = [], memo = '' }) {
   const info = race.horses?.race || {};
   const list = [...new Set([courseUrl(race.course), ...urls.map((u) => String(u).trim())].filter(Boolean))].slice(0, 8);
   const sources = [];
@@ -245,7 +258,7 @@ function researchText(rs) {
   return Object.entries(rs.sections).map(([k, v]) => `■${k}\n${v.map((x) => '・' + x).join('\n')}`).join('\n');
 }
 
-async function doYosou(env, race, { type, budget, partnerCount }) {
+export async function doYosou(env, race, { type, budget, partnerCount }) {
   if (!BET_TYPES[type]) throw new Error('券種を選んでください');
   const rules = await getRules(env);
   const data = race.horses;
@@ -257,7 +270,7 @@ async function doYosou(env, race, { type, budget, partnerCount }) {
 
   // 1) 全頭評価（6頭ずつ並列）
   const groups = [];
-  for (let i = 0; i < data.horses.length; i += 6) groups.push(data.horses.slice(i, i + 6).map((h) => h.馬番));
+  for (let i = 0; i < data.horses.length; i += 4) groups.push(data.horses.slice(i, i + 4).map((h) => h.馬番));
   const evalPrompt = (nos) => `${base}
 
 馬番 ${nos.join('・')} を評価してください。観点は次の10個で、この順番です。
@@ -265,7 +278,7 @@ ${VIEWPOINTS.map((v, i) => `${i + 1}.${v}：${VIEWPOINT_DESC[i]}`).join('\n')}
 各観点に ◎/○/△/× を付け、25字以内の根拠を書きます。データがない観点は △ にして「データなし」と書きます。
 脚質は通過順から 逃げ/先行/中団/後方 のどれかで判定します。崩れにくさは3着以内の安定感を0〜5で評価します。
 出力：{"evals":[{"馬番":1,"脚質":"先行","印列":"◎○△×○△○△○◎","根拠":["…10個…"],"崩れにくさ":3,"総合":78,"一言":"40字以内"}]}`;
-  const evalParts = await Promise.all(groups.map((g) => chatJSON(env, { system, user: evalPrompt(g), maxTokens: 4500 })));
+  const evalParts = await Promise.all(groups.map((g) => chatJSON(env, { system, user: evalPrompt(g), maxTokens: 3500, model: env.EVAL_MODEL || FAST_MODEL }).catch(() => chatJSON(env, { system, user: evalPrompt(g), maxTokens: 3500 }))));
   const evals = new Map();
   for (const p of evalParts) for (const e of p?.evals || []) if (data.horses.some((h) => h.馬番 === Number(e.馬番))) evals.set(Number(e.馬番), e);
   const evalList = data.horses.map((h) => {
@@ -360,7 +373,7 @@ ${evalList.map((e) => `${e.馬番}番 ${e.馬名}（${e.人気 ?? '?'}人気・$
   };
 }
 
-function yosouMarkdown(race, y) {
+export function yosouMarkdown(race, y) {
   const info = race.horses?.race || {};
   const name = (n) => race.horses.horses.find((h) => h.馬番 === n)?.馬名 || '';
   const L = [];
@@ -492,14 +505,44 @@ async function api(req, env, path) {
   }
   if (!(await authed(req, env))) return fail('ログインしてください', 401);
 
-  if (path === '/api/me') return json({ ok: true, betTypes: Object.fromEntries(Object.entries(BET_TYPES).map(([k, v]) => [k, v.label])), viewpoints: VIEWPOINTS });
+  if (path === '/api/me') return json({ ok: true, vapid: pushPublicKey(env), betTypes: Object.fromEntries(Object.entries(BET_TYPES).map(([k, v]) => [k, v.label])), viewpoints: VIEWPOINTS });
 
+  if (path === '/api/intake' && method === 'POST') {
+    const images = (body.images || []).slice(0, 8);
+    const text = String(body.text || '');
+    if (!images.length && !text.trim()) return fail('出馬表の画像またはテキストを入れてください');
+    if (!BET_TYPES[body.type]) return fail('券種を選んでください');
+    const budget = Number(body.budget);
+    if (!Number.isInteger(budget) || budget < 100 || budget % 100) return fail('予算は100円単位で入力してください');
+    const id = 'r' + crypto.randomUUID().replace(/-/g, '').slice(0, 10);
+    const imgs = [];
+    for (const im of images) {
+      const dataUrl = String(im.dataUrl || '');
+      if (!/^data:image\/(png|jpeg|webp);base64,/.test(dataUrl) || dataUrl.length > 8_000_000) return fail('画像形式が正しくありません');
+      const key = `img:${id}:${crypto.randomUUID()}`;
+      await env.IMAGES.put(key, dataUrl);
+      imgs.push({ key, name: String(im.name || '画像').slice(0, 80) });
+    }
+    await env.DB.prepare('INSERT INTO races (id, date, course, rnum, race_name, status, images, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)')
+      .bind(id, '', '', 0, '', 'new', JSON.stringify(imgs), now(), now()).run();
+    const job = await startJob(env, { raceId: id, from: 'read', type: body.type, budget, text });
+    return json({ raceId: id, job });
+  }
+  if (path === '/api/jobs/active') return json({ jobs: await activeJobs(env) });
+  if (path === '/api/push/key') return json({ key: pushPublicKey(env) });
+  if (path === '/api/push/subscribe' && method === 'POST') { await saveSubscription(env, body); return json({ ok: true }); }
+  if (path === '/api/push/latest') return json(await latestNotice(env));
+  if (path === '/api/push/status') {
+    const { results } = await env.DB.prepare('SELECT last_status, created_at FROM push_subs').all();
+    return json({ subscriptions: results.length, statuses: results.map((r) => r.last_status) });
+  }
   if (path === '/api/races' && method === 'GET') {
     await ensureSample(env);
     const { results } = await env.DB.prepare(
       'SELECT r.id, r.date, r.course, r.rnum, r.race_name, r.status, r.updated_at, l.hit, l.invest, l.payout FROM races r LEFT JOIN log l ON l.race_id = r.id ORDER BY r.date DESC, r.rnum DESC'
     ).all();
-    return json({ races: results });
+    const jobs = await activeJobs(env);
+    return json({ races: results.map((r) => ({ ...r, job: jobs.find((j) => j.race_id === r.id) || null })) });
   }
   if (path === '/api/races' && method === 'POST') {
     const date = String(body.date || '');
@@ -567,6 +610,18 @@ async function api(req, env, path) {
     ]);
     return json({ ok: true });
   }
+  if (sub === 'job' && method === 'GET') return json({ job: await jobStatus(env, id) });
+  if (sub === 'job' && method === 'POST') {
+    const from = ['read', 'research', 'yosou'].includes(body.from) ? body.from : 'research';
+    if (from !== 'read' && !race.horses?.confirmed) return fail('先に出走馬データを確認してください');
+    if (!BET_TYPES[body.type]) return fail('券種を選んでください');
+    const budget = Number(body.budget);
+    if (!Number.isInteger(budget) || budget < 100 || budget % 100) return fail('予算は100円単位で入力してください');
+    const running = await jobStatus(env, id);
+    if (running?.status === 'running') return fail('このレースはすでに処理中です');
+    const job = await startJob(env, { raceId: id, from, type: body.type, budget, text: String(body.text || ''), partnerCount: body.partnerCount || null });
+    return json({ job });
+  }
   if (sub === 'images' && method === 'POST') {
     const dataUrl = String(body.dataUrl || '');
     if (!/^data:image\/(png|jpeg|webp);base64,/.test(dataUrl)) return fail('画像形式が正しくありません');
@@ -608,7 +663,12 @@ async function api(req, env, path) {
       v.horses.forEach((h) => { h.要確認 = false; h.要確認項目 = []; });
       v.needsCheck = [];
     }
-    await saveRace(env, id, { horses: v, status: body.confirm ? 'confirmed' : 'read', race_name: v.race.レース名 || race.race_name || '' });
+    const key = raceKey(v.race);
+    if (body.confirm && (!key.date || !key.course || !key.rnum)) return fail('日付・競馬場・R番号を入力してください');
+    await saveRace(env, id, {
+      horses: v, status: body.confirm ? 'confirmed' : 'read', race_name: v.race.レース名 || race.race_name || '',
+      ...(key.date ? { date: key.date } : {}), ...(key.course ? { course: key.course } : {}), ...(key.rnum ? { rnum: key.rnum } : {}),
+    });
     return json({ horses: v });
   }
   if (sub === 'research' && method === 'POST') {

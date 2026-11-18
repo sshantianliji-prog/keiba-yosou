@@ -35,3 +35,24 @@ CREATE TABLE IF NOT EXISTS proposals (
   status TEXT DEFAULT 'pending',
   created_at TEXT DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS jobs (
+  id TEXT PRIMARY KEY,
+  race_id TEXT,
+  status TEXT,
+  stage TEXT,
+  stages TEXT,
+  params TEXT,
+  message TEXT,
+  started_at INTEGER,
+  stage_started_at INTEGER,
+  finished_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS jobs_race ON jobs (race_id, started_at);
+
+CREATE TABLE IF NOT EXISTS push_subs (
+  endpoint TEXT PRIMARY KEY,
+  data TEXT,
+  last_status INTEGER,
+  created_at TEXT
+);

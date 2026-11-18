@@ -207,17 +207,22 @@ async function viewRaces() {
   const { races } = await api('/api/races');
   const items = races.map((r, i) => {
     const [label, color] = STATUS[r.status] || ['', ''];
-    const res = r.status === 'settled' ? `<span class="chip ${r.hit ? 'green' : ''}">${r.hit ? '的中' : '不的中'}</span>` : `<span class="chip ${color}">${label}</span>`;
+    let res = r.status === 'settled' ? `<span class="chip ${r.hit ? 'green' : ''}">${r.hit ? '的中' : '不的中'}</span>` : `<span class="chip ${color}">${label}</span>`;
+    if (r.job?.status === 'running') res = `<span class="chip blue" data-eta-chip="${esc(r.id)}"><span class="mini-orb"></span><span data-eta-text>予想中</span></span>`;
+    else if (r.job?.status === 'needs_check' && !['predicted', 'settled'].includes(r.status)) res = '<span class="chip orange">確認が必要</span>';
+    else if (r.job?.status === 'error' && !['predicted', 'settled'].includes(r.status)) res = '<span class="chip red">失敗</span>';
     return `<a class="list-item reveal" style="--i:${i}" href="#/race/${encodeURIComponent(r.id)}" data-testid="race-item" data-id="${esc(r.id)}">
-      <span class="badge-r">${r.rnum}R</span>
-      <div class="li-main"><div class="li-title">${esc(r.course)} ${r.rnum}R ${esc(r.race_name || '')}</div><div class="li-sub">${esc(r.date)}</div></div>
+      <span class="badge-r">${r.rnum ? r.rnum + 'R' : '…'}</span>
+      <div class="li-main"><div class="li-title">${raceTitle(r)}</div><div class="li-sub">${esc(r.date || '判別中')}</div></div>
       ${res}${ICON.chev}</a>`;
   }).join('');
   render(`
     ${pageHeader('レース', { actions: `<button class="icon-btn" data-act="new" aria-label="新規レース" data-testid="new-race">${ICON.plus}</button><button class="icon-btn" data-act="logout" aria-label="ログアウト" data-testid="logout">${ICON.out}</button>` })}
     ${races.length ? `<div class="list glass reveal" data-testid="race-list">${items}</div>` : `<div class="card glass reveal muted" style="text-align:center">レースがありません</div>`}
   `, () => {
-    $$('[data-act="new"]', app).forEach((b) => b.addEventListener('click', newRaceSheet));
+    $$('[data-act="new"]', app).forEach((b) => b.addEventListener('click', intakeSheet));
+    const running = races.filter((r) => r.job?.status === 'running');
+    if (running.length) watchList(running.map((r) => r.job));
     $$('[data-act="logout"]', app).forEach((b) => b.addEventListener('click', async () => { await api('/api/logout', { method: 'POST' }); location.hash = '#/login'; }));
   });
   hideSkeleton();
@@ -236,30 +241,135 @@ function sheet(html, onMount) {
   onMount($('.sheet', root), close);
 }
 
-function newRaceSheet() {
-  const d = new Date();
-  const dow = d.getDay();
-  const add = dow === 6 || dow === 0 ? 0 : 6 - dow;
-  const sat = new Date(d.getTime() + add * 864e5);
-  const iso = new Date(sat.getTime() - sat.getTimezoneOffset() * 6e4).toISOString().slice(0, 10);
+const raceTitle = (r) => r.course ? `${esc(r.course)} ${r.rnum}R ${esc(r.race_name || '')}` : '判別中のレース';
+const prefs = () => { try { return JSON.parse(localStorage.getItem('ky_prefs') || '{}'); } catch { return {}; } };
+const savePrefs = (p) => { try { localStorage.setItem('ky_prefs', JSON.stringify({ ...prefs(), ...p })); } catch {} };
+
+function betFields(sel = {}) {
+  const p = { type: 'sanrenpuku_1', budget: 600, ...prefs(), ...sel };
+  return `
+    <label class="field"><span>券種</span><select class="input" name="type" data-testid="bet-type">${Object.entries(META.betTypes).map(([k, v]) => `<option value="${k}" ${p.type === k ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select></label>
+    <label class="field"><span>予算（円）</span><div class="stepper"><button type="button" data-d="-100" aria-label="100円減らす">−</button><input name="budget" inputmode="numeric" value="${p.budget}" data-testid="budget"><button type="button" data-d="100" aria-label="100円増やす">＋</button></div></label>`;
+}
+function bindStepper(root) {
+  $$('.stepper button', root).forEach((b) => b.addEventListener('click', () => {
+    const el = $('input', b.parentElement);
+    el.value = Math.max(100, (Number(el.value) || 0) + Number(b.dataset.d));
+  }));
+}
+function readBet(root) {
+  const type = $('[name=type]', root).value;
+  const budget = Number($('[name=budget]', root).value);
+  if (!Number.isInteger(budget) || budget < 100 || budget % 100) throw new Error('予算は100円単位で入力してください');
+  savePrefs({ type, budget });
+  return { type, budget };
+}
+
+function intakeSheet() {
+  const files = [];
   sheet(`
-    <h2>新規レース</h2>
-    <form class="grid" style="display:grid;gap:14px" data-testid="new-race-form">
-      <label class="field"><span>日付</span><input class="input" type="date" name="date" value="${iso}" required data-testid="nr-date"></label>
-      <label class="field"><span>競馬場</span><select class="input" name="course" data-testid="nr-course">${COURSES.map((c) => `<option ${c === '東京' ? 'selected' : ''}>${c}</option>`).join('')}</select></label>
-      <label class="field"><span>R番号</span><select class="input" name="rnum" data-testid="nr-rnum">${Array.from({ length: 12 }, (_, i) => `<option value="${i + 1}" ${i === 10 ? 'selected' : ''}>${i + 1}R</option>`).join('')}</select></label>
-      <div class="row" style="margin-top:6px"><button type="button" class="btn secondary" data-close style="flex:1">キャンセル</button><button class="btn" style="flex:1" data-testid="nr-submit">作成</button></div>
+    <h2>出馬表から予想</h2>
+    <form style="display:grid;gap:14px" data-testid="intake-form">
+      <label class="drop" data-testid="dropzone">${ICON.photo}<span>出馬表のスクショを選択</span><span class="small muted">日付・競馬場・R番号はAIが自動で判別します（最大8枚）</span>
+        <input type="file" accept="image/*" multiple hidden data-testid="file-input"></label>
+      <div class="thumbs" data-testid="intake-thumbs"></div>
+      <details class="past"><summary>テキストで入力する</summary><div><textarea class="input" name="text" placeholder="出馬表ページの文字をコピーして貼り付け" data-testid="paste-text" style="margin-top:8px"></textarea></div></details>
+      <div class="grid2">${betFields()}</div>
+      <label class="row small" style="gap:8px"><input type="checkbox" name="notify" ${pushState() === 'off' ? '' : 'checked'} data-testid="notify"> 完了したら通知する</label>
+      ${isIOS() && !isStandalone() ? '<div class="banner info small">iPhoneで通知を受け取るには、Safariの共有ボタンから「ホーム画面に追加」し、ホーム画面のアイコンから開いてください。</div>' : ''}
+      <div class="row"><button type="button" class="btn secondary" data-close style="flex:1">キャンセル</button><button class="btn" style="flex:1" data-testid="intake-submit">予想する</button></div>
     </form>`, (el, close) => {
+    bindStepper(el);
     $('[data-close]', el).addEventListener('click', close);
+    const input = $('input[type=file]', el);
+    const drop = $('.drop', el);
+    const draw = () => { $('.thumbs', el).innerHTML = files.map((f, i) => `<div class="thumb"><img src="${f.dataUrl}" alt=""><button type="button" data-rm="${i}" aria-label="削除">${ICON.x}</button></div>`).join(''); };
+    const add = async (list) => {
+      for (const f of [...list].filter((f) => f.type.startsWith('image/')).slice(0, 8 - files.length)) files.push({ name: f.name, dataUrl: await resizeImage(f) });
+      draw();
+    };
+    input.addEventListener('change', () => add(input.files));
+    ['dragenter', 'dragover'].forEach((t) => drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.add('over'); }));
+    ['dragleave', 'drop'].forEach((t) => drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.remove('over'); }));
+    drop.addEventListener('drop', (e) => add(e.dataTransfer.files));
+    $('.thumbs', el).addEventListener('click', (e) => { const b = e.target.closest('[data-rm]'); if (b) { files.splice(Number(b.dataset.rm), 1); draw(); } });
     $('form', el).addEventListener('submit', async (e) => {
       e.preventDefault();
       const f = e.target;
-      const r = await busy($('[data-testid="nr-submit"]', el), () => api('/api/races', { method: 'POST', body: { date: f.date.value, course: f.course.value, rnum: Number(f.rnum.value) } }));
-      if (r.existed) toast('同じレースが既にあるため開きます');
+      const btn = $('[data-testid="intake-submit"]', el);
+      let bet;
+      try {
+        bet = readBet(el);
+        if (!files.length && !f.text.value.trim()) throw new Error('出馬表の画像またはテキストを入れてください');
+      } catch (err) { return toast(err.message, 'err'); }
+      if (f.notify.checked) enablePush().catch(() => {});
+      else savePushPref('off');
+      const r = await busy(btn, () => api('/api/intake', { method: 'POST', body: { images: files, text: f.text.value, ...bet } })).catch(() => null);
+      if (!r) return;
       close();
-      location.hash = `#/race/${encodeURIComponent(r.id)}`;
+      location.hash = `#/race/${encodeURIComponent(r.raceId)}`;
     });
   });
+}
+
+// ---------- 残り時間 ----------
+function remaining(job) {
+  const nowS = Date.now() - (job.recv - job.now);
+  const idx = Math.max(0, job.stages.indexOf(job.stage));
+  const inStage = (nowS - job.stage_started_at) / 1000;
+  let rest = Math.max(3, job.est[job.stage] - inStage);
+  for (const s of job.stages.slice(idx + 1)) rest += job.est[s];
+  const total = job.stages.reduce((a, s) => a + job.est[s], 0);
+  const elapsed = (nowS - job.started_at) / 1000;
+  return { rest, over: inStage > job.est[job.stage] + 2 && idx === job.stages.length - 1, pct: Math.min(0.97, elapsed / Math.max(elapsed + rest, total)) };
+}
+const stamp = (job) => (job ? { ...job, recv: Date.now() } : job);
+const fmtRest = (sec) => {
+  sec = Math.ceil(sec);
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return m ? `あと${m}分${String(s).padStart(2, '0')}秒` : `あと${s}秒`;
+};
+
+let listTimer = null;
+function watchList(jobs) {
+  clearInterval(listTimer);
+  jobs = jobs.map(stamp);
+  let ticks = 0;
+  listTimer = setInterval(async () => {
+    if ((location.hash || '#/') !== '#/') { clearInterval(listTimer); return; }
+    ticks++;
+    for (const j of jobs) {
+      const chip = $(`[data-eta-chip="${CSS.escape(j.race_id)}"] [data-eta-text]`);
+      if (chip) { const r = remaining(j); chip.textContent = r.over ? 'まもなく完了' : fmtRest(r.rest); }
+    }
+    if (ticks % 4 === 0) {
+      const res = await api('/api/jobs/active').catch(() => null);
+      if (!res) return;
+      const still = res.jobs.filter((f) => f.status === 'running');
+      if (jobs.some((j) => !still.some((f) => f.id === j.id))) { clearInterval(listTimer); toast('予想完了'); viewRaces(); return; }
+      jobs = still.map(stamp);
+    }
+  }, 1000);
+}
+
+// ---------- 通知 ----------
+const isIOS = () => /iPhone|iPad|iPod/.test(navigator.userAgent);
+const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+const pushState = () => { try { return localStorage.getItem('ky_push') || ''; } catch { return ''; } };
+const savePushPref = (v) => { try { localStorage.setItem('ky_push', v); } catch {} };
+const b64uToBytes = (s) => { const b = atob((s + '='.repeat((4 - (s.length % 4)) % 4)).replace(/-/g, '+').replace(/_/g, '/')); return Uint8Array.from(b, (c) => c.charCodeAt(0)); };
+let swReg = null;
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').then((r) => (swReg = r)).catch(() => {});
+async function enablePush() {
+  if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) throw new Error('この環境は通知に対応していません');
+  const perm = await Notification.requestPermission();
+  if (perm !== 'granted') { savePushPref('off'); throw new Error('通知が許可されませんでした'); }
+  const reg = swReg || (await navigator.serviceWorker.ready);
+  let sub = await reg.pushManager.getSubscription();
+  if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64uToBytes(META.vapid) });
+  await api('/api/push/subscribe', { method: 'POST', body: sub.toJSON() });
+  savePushPref('on');
+  return true;
 }
 
 // ---------- レース詳細 ----------
@@ -295,19 +405,21 @@ async function viewRace(id) {
   const info = race.horses?.race || {};
   const sub = [race.date, info.クラス, info.芝ダ && info.距離 ? `${info.芝ダ}${info.距離}m` : '', info.回り && info.回り !== 'なし' ? info.回り : ''].filter(Boolean).map(esc).join('・');
   render(`
-    ${pageHeader(`${race.course} ${race.rnum}R ${race.race_name || ''}`.trim(), {
+    ${pageHeader(race.course ? `${race.course} ${race.rnum}R ${race.race_name || ''}`.trim() : '判別中のレース', {
       back: '#/', sub,
       actions: `<button class="icon-btn" data-act="del" aria-label="削除" data-testid="delete-race" style="color:var(--red)">${ICON.trash}</button>`,
     })}
     <div class="segmented reveal" role="tablist" data-testid="steps"><span class="thumb"></span>
       ${STEPS.map(([k, l]) => `<button role="tab" data-step="${k}" data-testid="step-${k}" class="${stepDone(race, k) ? 'done' : ''}"><span class="dot"></span>${l}</button>`).join('')}
     </div>
+    <div id="jobCard"></div>
     <div id="panel" style="margin-top:16px"></div>
   `, () => {
     $$('[data-step]', app).forEach((b) => b.addEventListener('click', () => goStep(b.dataset.step)));
     $$('[data-act="del"]', app).forEach((b) => b.addEventListener('click', () => confirmDelete(race)));
     goStep(state.step, true);
     addEventListener('resize', moveThumb);
+    watchJob(race.id);
   });
   hideSkeleton();
 }
@@ -356,6 +468,71 @@ function confirmDelete(race) {
   });
 }
 
+// --- ジョブの進み具合 ---
+let jobTimer = null;
+async function watchJob(raceId, fresh = null) {
+  clearInterval(jobTimer);
+  let job = stamp(fresh || (await api(`/api/races/${encodeURIComponent(raceId)}/job`).catch(() => ({ job: null }))).job);
+  const card = $('#jobCard', app);
+  if (!card) return;
+  if (!job || job.status !== 'running') {
+    setBusyUI(false);
+    if (job?.status === 'error' && !state.race.yosou) card.innerHTML = `<div class="banner err reveal" style="margin-top:14px" data-testid="job-error">予想できませんでした：${esc(job.message)}</div>`;
+    else if (job?.status === 'needs_check' && !state.race.horses?.confirmed) card.innerHTML = `<div class="banner warn reveal" style="margin-top:14px" data-testid="needs-check-banner">${esc(job.message)}</div>`;
+    else card.innerHTML = '';
+    return;
+  }
+  setBusyUI(true);
+  card.innerHTML = `
+    <div class="card glass job-card reveal" style="margin-top:14px" data-testid="job-card">
+      <div class="row" style="flex-wrap:nowrap"><span class="orb-lg"></span><div style="flex:1;min-width:0"><b data-stage>${esc(job.labels[job.stage])}</b>
+        <div class="small muted">アプリを閉じても処理は続きます。完了したら通知します。</div></div>
+        <div class="eta" data-testid="eta">--</div></div>
+      <div class="progress"><i data-bar></i></div>
+      <div class="stage-dots">${job.stages.map((s) => `<span data-sd="${s}">${{ read: '読み取り', research: 'リサーチ', yosou: '予想' }[s]}</span>`).join('')}</div>
+    </div>`;
+  const paint = () => {
+    const r = remaining(job);
+    $('[data-testid="eta"]', card).textContent = r.over ? 'まもなく完了' : fmtRest(r.rest);
+    $('[data-bar]', card).style.width = `${(r.pct * 100).toFixed(1)}%`;
+    $('[data-stage]', card).textContent = job.labels[job.stage];
+    const idx = job.stages.indexOf(job.stage);
+    $$('[data-sd]', card).forEach((el, i) => { el.classList.toggle('done', i < idx); el.classList.toggle('now', i === idx); });
+  };
+  paint();
+  let ticks = 0;
+  jobTimer = setInterval(async () => {
+    if (!$('#jobCard', app) || state.race?.id !== raceId) return clearInterval(jobTimer);
+    paint();
+    if (++ticks % 3) return;
+    const res = await api(`/api/races/${encodeURIComponent(raceId)}/job`).catch(() => null);
+    if (!res?.job) return;
+    job = stamp(res.job);
+    if (job.status === 'running') return;
+    clearInterval(jobTimer);
+    setBusyUI(false);
+    if (job.status === 'done') { toast('予想完了'); confetti(); }
+    else if (job.status === 'needs_check') toast('確認が必要です', 'err');
+    else toast('予想できませんでした', 'err');
+    const target = job.status === 'done' ? 'yosou' : job.status === 'needs_check' ? 'check' : null;
+    const next = `#/race/${encodeURIComponent(raceId)}${target ? `?step=${target}` : ''}`;
+    if (location.hash === next) viewRace(raceId); else location.hash = next;
+  }, 1000);
+}
+function setBusyUI(on) {
+  $$('#panel [data-job-btn]', app).forEach((b) => (b.disabled = on));
+}
+async function startJob(btn, body) {
+  const r = await busy(btn, () => api(`/api/races/${encodeURIComponent(state.race.id)}/job`, { method: 'POST', body }));
+  if ('Notification' in window && pushState() !== 'off' && Notification.permission !== 'denied') enablePush().catch(() => {});
+  watchJob(state.race.id, r.job);
+  scrollTo({ top: 0, behavior: reduced ? 'auto' : 'smooth' });
+}
+const lastBet = () => {
+  const y = state.race?.yosou;
+  return y ? { type: y.type, budget: y.budget } : { type: prefs().type || 'sanrenpuku_1', budget: prefs().budget || 600 };
+};
+
 // --- 1. 読み取り ---
 function resizeImage(file) {
   return new Promise((resolve, reject) => {
@@ -389,9 +566,9 @@ function panelRead(panel) {
       <div class="thumbs" data-testid="thumbs">${thumbs()}</div>
       <h3>テキストで入力（任意）</h3>
       <textarea class="input" id="pasteText" placeholder="出馬表ページの文字をコピーして貼り付けると、画像より正確に読み取れます" data-testid="paste-text"></textarea>
+      <div class="grid2" style="margin-top:14px" id="readBet">${betFields(lastBet())}</div>
       <div class="row end" style="margin-top:14px">
-        ${h ? '<label class="row small muted"><input type="checkbox" id="resetRead"> 既存の読み取り結果を破棄する</label><span class="spacer"></span>' : ''}
-        <button class="btn" id="doRead" data-testid="do-read">読み取る</button>
+        <button class="btn" id="doRead" data-testid="do-read" data-job-btn>読み取って予想する</button>
       </div>
     </div>
     <div id="readOut" style="margin-top:14px">${h ? readSummary(h) : ''}</div>`;
@@ -419,18 +596,13 @@ function panelRead(panel) {
     race.images = r.images;
     $('.thumbs', panel).innerHTML = thumbs();
   });
+  bindStepper($('#readBet', panel));
   $('#doRead', panel).addEventListener('click', async (e) => {
     const text = $('#pasteText', panel).value;
     if (!race.images.length && !text.trim()) return toast('画像またはテキストを入力してください', 'err');
-    const out = $('#readOut', panel);
-    out.innerHTML = inlineSkeleton('出馬表を読み取っています', 8);
-    try {
-      const r = await busy(e.currentTarget, () => api(`/api/races/${encodeURIComponent(race.id)}/read`, { method: 'POST', body: { text, reset: !!$('#resetRead', panel)?.checked } }));
-      race.horses = r.horses;
-      if (r.horses.race?.レース名 && !race.race_name) race.race_name = r.horses.race.レース名;
-      out.innerHTML = readSummary(r.horses);
-      refreshSteps();
-    } catch { out.innerHTML = ''; }
+    let bet;
+    try { bet = readBet($('#readBet', panel)); } catch (err) { return toast(err.message, 'err'); }
+    await startJob(e.currentTarget, { from: 'read', text, ...bet }).catch(() => {});
   });
   $('#readOut', panel).addEventListener('click', (e) => { if (e.target.closest('[data-go-check]')) goStep('check'); });
 }
@@ -445,7 +617,7 @@ function readSummary(h) {
 }
 
 // --- 2. 確認 ---
-const RACE_FIELDS = [['レース名', 'text'], ['クラス', 'text'], ['芝ダ', 'text'], ['距離', 'number'], ['回り', 'text'], ['頭数', 'number'], ['発走時刻', 'text'], ['馬場状態', 'text']];
+const RACE_FIELDS = [['日付', 'text'], ['競馬場', 'text'], ['R番号', 'number'], ['レース名', 'text'], ['クラス', 'text'], ['芝ダ', 'text'], ['距離', 'number'], ['回り', 'text'], ['頭数', 'number'], ['発走時刻', 'text'], ['馬場状態', 'text']];
 const HORSE_COLS = [['枠番', 'w-s', 'number'], ['馬番', 'w-s', 'number'], ['馬名', 'w-name', 'text'], ['性齢', 'w-s', 'text'], ['斤量', 'w-s', 'number'], ['騎手', 'w-m', 'text'], ['調教師', 'w-m', 'text'], ['単勝オッズ', 'w-s', 'number'], ['人気', 'w-s', 'number'], ['馬体重', 'w-s', 'number'], ['増減', 'w-s', 'number'], ['戦績', 'w-m', 'text']];
 const PAST_COLS = ['日付', '競馬場', 'レース名', 'クラス', '距離', '馬場', '頭数', '人気', '着順', 'タイム', '通過順', '上がり3F', '着差', '相手'];
 
@@ -471,7 +643,7 @@ function panelCheck(panel) {
       </tbody></table></div>
       <div class="row end" style="margin-top:16px">
         <button class="btn secondary" id="saveH" data-testid="save-horses">保存</button>
-        <button class="btn" id="confirmH" data-testid="confirm-horses">確認して次へ</button>
+        <button class="btn" id="confirmH" data-testid="confirm-horses" data-job-btn>${race.yosou ? '確認して保存' : '確認して予想を続ける'}</button>
       </div>
     </div>`;
   // 近走の編集（開いたときに描画）
@@ -511,7 +683,18 @@ function panelCheck(panel) {
     return r;
   };
   $('#saveH', panel).addEventListener('click', async (e) => { await save(e.currentTarget, false); toast('保存しました'); panelCheck(panel); });
-  $('#confirmH', panel).addEventListener('click', async (e) => { await save(e.currentTarget, true); toast('確認しました'); goStep('research'); });
+  $('#confirmH', panel).addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    await save(btn, true);
+    toast('確認しました');
+    const fresh = await api(`/api/races/${encodeURIComponent(race.id)}`);
+    Object.assign(race, fresh.race);
+    if (race.yosou) return panelCheck(panel);
+    $('.large-title h1', app).textContent = `${race.course} ${race.rnum}R ${race.race_name || ''}`;
+    $('#jobCard', app).innerHTML = '';
+    await startJob(btn, { from: 'research', ...lastBet() });
+    goStep('yosou');
+  });
 }
 
 // --- 3. リサーチ ---
@@ -563,11 +746,11 @@ function panelYosou(panel) {
     <div class="card glass reveal">
       <h2>券種と予算</h2>
       <div class="grid2">
-        <label class="field"><span>券種</span><select class="input" id="btype" data-testid="bet-type">${Object.entries(META.betTypes).map(([k, v]) => `<option value="${k}" ${(y?.type || 'sanrenpuku_1') === k ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select></label>
-        <label class="field"><span>予算（円）</span><div class="stepper"><button type="button" data-d="-100" aria-label="100円減らす">−</button><input id="budget" inputmode="numeric" value="${y?.budget || 600}" data-testid="budget"><button type="button" data-d="100" aria-label="100円増やす">＋</button></div></label>
+        <label class="field"><span>券種</span><select class="input" id="btype" data-testid="bet-type">${Object.entries(META.betTypes).map(([k, v]) => `<option value="${k}" ${(y?.type || prefs().type || 'sanrenpuku_1') === k ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select></label>
+        <label class="field"><span>予算（円）</span><div class="stepper"><button type="button" data-d="-100" aria-label="100円減らす">−</button><input id="budget" inputmode="numeric" value="${y?.budget || prefs().budget || 600}" data-testid="budget"><button type="button" data-d="100" aria-label="100円増やす">＋</button></div></label>
         <label class="field"><span>相手の頭数</span><select class="input" id="pcount" data-testid="partner-count"><option value="">おまかせ</option>${[1, 2, 3, 4, 5, 6].map((n) => `<option>${n}</option>`).join('')}</select></label>
       </div>
-      <div class="row end" style="margin-top:14px"><button class="btn" id="doY" data-testid="do-yosou">${y ? '予想し直す' : '予想する'}</button></div>
+      <div class="row end" style="margin-top:14px"><button class="btn" id="doY" data-testid="do-yosou" data-job-btn>${y ? '予想し直す' : '予想する'}</button></div>
     </div>
     <div id="yOut" style="margin-top:14px">${y ? yosouView(y) : ''}</div>`;
   $$('.stepper button', panel).forEach((b) => b.addEventListener('click', () => {
@@ -577,14 +760,9 @@ function panelYosou(panel) {
   $('#doY', panel).addEventListener('click', async (e) => {
     const budget = Number($('#budget', panel).value);
     if (!Number.isInteger(budget) || budget < 100 || budget % 100) return toast('予算は100円単位で入力してください', 'err');
-    const out = $('#yOut', panel);
-    out.innerHTML = inlineSkeleton('全頭を評価しています', 10);
-    try {
-      const r = await busy(e.currentTarget, () => api(`/api/races/${encodeURIComponent(race.id)}/yosou`, { method: 'POST', body: { type: $('#btype', panel).value, budget, partnerCount: $('#pcount', panel).value || null } }));
-      race.yosou = r.yosou;
-      out.innerHTML = yosouView(r.yosou);
-      refreshSteps();
-    } catch { out.innerHTML = ''; }
+    const type = $('#btype', panel).value;
+    savePrefs({ type, budget });
+    await startJob(e.currentTarget, { from: race.research ? 'yosou' : 'research', type, budget, partnerCount: $('#pcount', panel).value || null }).catch(() => {});
   });
   $('#yOut', panel).addEventListener('click', (e) => {
     if (e.target.closest('[data-dl]')) download(`${race.id}_yosou.md`, race.yosou.markdown, 'text/markdown');
