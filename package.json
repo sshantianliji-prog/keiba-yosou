@@ -16,5 +16,8 @@
     "@playwright/test": "^1.65.1",
     "wrangler": "^4.164.0"
   },
-  "private": true
+  "private": true,
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.11.0"
+  }
 }

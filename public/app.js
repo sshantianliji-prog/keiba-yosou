@@ -265,6 +265,39 @@ function readBet(root) {
   return { type, budget };
 }
 
+// Claude アプリでスクショを書き起こしてもらうための指示。出力をそのまま貼るとAIを使わずに取り込める
+const CLAUDE_APP_PROMPT = `添付したJRAの出馬表（馬柱）のスクリーンショット（レース情報の画面があればそれも）を、下のJSON形式に書き写してください。
+
+ルール
+- 写っている文字だけを正確に書き写し、推測で埋めないでください。読めない値は null にしてください。
+- スクリーンショットが複数あるときは、重なっている馬を1頭1回だけにして、馬番順に並べてください。
+- 調教師は馬名の欄の下線付きで（栗東）（美浦）が付く名前、騎手は性齢・負担重量の下の下線付きの名前です。
+- 近走は新しい順に最大4走。「16頭 11番」は頭数と馬番、人気は「2番人気」の数字です。距離は「芝1800」「ダ1400」の形にしてください。
+- レース情報の画面（ⓘボタンで出る画面など）があれば、日付・レース名・クラス・芝ダ・距離・回り・発走時刻を race に書き写してください。
+- 画面にない項目は null にしてください。「5回京都4日 11R」なら 競馬場は京都、R番号は11です。
+- 自信のない値がある馬には "要確認項目" に項目名を入れてください。
+- 説明文は書かず、JSONだけを1つのコードブロックで出力してください。
+
+形式
+{"race":{"日付":null,"競馬場":"京都","R番号":11,"レース名":null,"クラス":null,"芝ダ":null,"距離":null,"頭数":null,"発走時刻":null,"馬場状態":null},
+ "horses":[
+  {"枠番":1,"馬番":1,"馬名":"","性齢":"牝5","斤量":56.0,"騎手":"","調教師":"","単勝オッズ":32.0,"人気":11,"馬体重":492,"増減":2,
+   "近走":[{"日付":"2026-10-11","競馬場":"東京","レース名":"","クラス":"GⅡ","距離":"芝1800","馬場":"良","頭数":16,"人気":2,"着順":3,"タイム":"1:44.9","通過順":"10-9-11","上がり3F":33.6,"着差":"0.5","相手":""}],
+   "要確認項目":[]}
+ ]}`;
+async function copyClaudePrompt(btn) {
+  try {
+    await navigator.clipboard.writeText(CLAUDE_APP_PROMPT);
+  } catch {
+    const t = document.createElement('textarea');
+    t.value = CLAUDE_APP_PROMPT; document.body.appendChild(t); t.select();
+    document.execCommand('copy'); t.remove();
+  }
+  toast('指示をコピーしました。Claude アプリにスクショと一緒に貼り付けて送ってください');
+  if (btn) btn.blur();
+}
+const CLAUDE_HELP = '<div class="small muted" style="margin-top:6px">Claude アプリに出馬表とレース情報（ⓘ）のスクショと「指示」を送り、返ってきた結果をここに貼ると、AIの費用をかけずに取り込めます。</div><button type="button" class="btn secondary" data-claude-prompt style="margin-top:8px" data-testid="copy-claude-prompt">Claude 用の指示をコピー</button>';
+
 function intakeSheet() {
   const files = [];
   sheet(`
@@ -273,7 +306,7 @@ function intakeSheet() {
       <label class="drop" data-testid="dropzone">${ICON.photo}<span>出馬表のスクショを選択</span><span class="small muted">日付・競馬場・R番号はAIが自動で判別します（最大8枚）</span>
         <input type="file" accept="image/*" multiple hidden data-testid="file-input"></label>
       <div class="thumbs" data-testid="intake-thumbs"></div>
-      <details class="past"><summary>テキストで入力する</summary><div><textarea class="input" name="text" placeholder="出馬表ページの文字をコピーして貼り付け" data-testid="paste-text" style="margin-top:8px"></textarea></div></details>
+      <details class="past"><summary>テキストで入力する（Claude アプリの書き起こしも可）</summary><div>${CLAUDE_HELP}<textarea class="input" name="text" placeholder="Claude アプリの結果、または出馬表ページの文字を貼り付け" data-testid="paste-text" style="margin-top:8px"></textarea></div></details>
       <div class="grid2">${betFields()}</div>
       <label class="row small" style="gap:8px"><input type="checkbox" name="notify" ${pushState() === 'off' ? '' : 'checked'} data-testid="notify"> 完了したら通知する</label>
       ${isIOS() && !isStandalone() ? '<div class="banner info small">iPhoneで通知を受け取るには、Safariの共有ボタンから「ホーム画面に追加」し、ホーム画面のアイコンから開いてください。</div>' : ''}
@@ -281,11 +314,12 @@ function intakeSheet() {
     </form>`, (el, close) => {
     bindStepper(el);
     $('[data-close]', el).addEventListener('click', close);
+    $('[data-claude-prompt]', el).addEventListener('click', (e) => copyClaudePrompt(e.currentTarget));
     const input = $('input[type=file]', el);
     const drop = $('.drop', el);
     const draw = () => { $('.thumbs', el).innerHTML = files.map((f, i) => `<div class="thumb"><img src="${f.dataUrl}" alt=""><button type="button" data-rm="${i}" aria-label="削除">${ICON.x}</button></div>`).join(''); };
     const add = async (list) => {
-      for (const f of [...list].filter((f) => f.type.startsWith('image/')).slice(0, 8 - files.length)) files.push({ name: f.name, dataUrl: await resizeImage(f) });
+      for (const f of [...list].filter((f) => f.type.startsWith('image/')).slice(0, 8 - files.length)) files.push({ name: f.name, ...(await prepareImage(f)) });
       draw();
     };
     input.addEventListener('change', () => add(input.files));
@@ -534,6 +568,41 @@ const lastBet = () => {
 };
 
 // --- 1. 読み取り ---
+// 縦長の出馬表スクリーンショットは、AIが細かい文字を読めるよう数頭ずつの帯に切って一緒に送る。
+// 帯どうしは馬1頭分以上重ねて、どの馬もどこかの帯に丸ごと写るようにする
+function loadImage(file) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => { URL.revokeObjectURL(img.src); resolve(img); };
+    img.onerror = () => reject(new Error('画像を読み込めませんでした'));
+    img.src = URL.createObjectURL(file);
+  });
+}
+function drawJpeg(img, sx, sy, sw, sh, scale) {
+  const c = document.createElement('canvas');
+  c.width = Math.round(sw * scale);
+  c.height = Math.round(sh * scale);
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(img, sx, sy, sw, sh, 0, 0, c.width, c.height);
+  return c.toDataURL('image/jpeg', 0.86);
+}
+async function prepareImage(file) {
+  const img = await loadImage(file);
+  const w = img.naturalWidth, h = img.naturalHeight;
+  const dataUrl = drawJpeg(img, 0, 0, w, h, Math.min(1, 2000 / Math.max(w, h)));
+  if (h < w * 0.9) return { dataUrl };
+  const stripH = Math.round(w * 0.55), step = Math.round(w * 0.4);
+  const scale = Math.min(1.5, 1400 / w);
+  const parts = [];
+  for (let y = 0; ; y += step) {
+    const bottom = Math.min(h, y + stripH);
+    parts.push(drawJpeg(img, 0, y, w, bottom - y, scale));
+    if (bottom >= h || parts.length >= 12) break;
+  }
+  return { dataUrl, parts };
+}
 function resizeImage(file) {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -565,7 +634,8 @@ function panelRead(panel) {
         <input type="file" accept="image/*" multiple hidden data-testid="file-input"></label>
       <div class="thumbs" data-testid="thumbs">${thumbs()}</div>
       <h3>テキストで入力（任意）</h3>
-      <textarea class="input" id="pasteText" placeholder="出馬表ページの文字をコピーして貼り付けると、画像より正確に読み取れます" data-testid="paste-text"></textarea>
+      ${CLAUDE_HELP}
+      <textarea class="input" id="pasteText" placeholder="Claude アプリの結果、または出馬表ページの文字を貼り付け（Claude アプリの結果を貼った場合、画像は読みません）" data-testid="paste-text" style="margin-top:8px"></textarea>
       <div class="grid2" style="margin-top:14px" id="readBet">${betFields(lastBet())}</div>
       <div class="row end" style="margin-top:14px">
         <button class="btn" id="doRead" data-testid="do-read" data-job-btn>読み取って予想する</button>
@@ -577,8 +647,7 @@ function panelRead(panel) {
   const upload = async (files) => {
     for (const f of [...files].filter((f) => f.type.startsWith('image/'))) {
       try {
-        const dataUrl = await resizeImage(f);
-        const r = await api(`/api/races/${encodeURIComponent(race.id)}/images`, { method: 'POST', body: { dataUrl, name: f.name } });
+        const r = await api(`/api/races/${encodeURIComponent(race.id)}/images`, { method: 'POST', body: { ...(await prepareImage(f)), name: f.name } });
         race.images = r.images;
         $('.thumbs', panel).innerHTML = thumbs();
       } catch (e) { toast(e.message, 'err'); }
@@ -597,6 +666,7 @@ function panelRead(panel) {
     $('.thumbs', panel).innerHTML = thumbs();
   });
   bindStepper($('#readBet', panel));
+  $('[data-claude-prompt]', panel).addEventListener('click', (e) => copyClaudePrompt(e.currentTarget));
   $('#doRead', panel).addEventListener('click', async (e) => {
     const text = $('#pasteText', panel).value;
     if (!race.images.length && !text.trim()) return toast('画像またはテキストを入力してください', 'err');

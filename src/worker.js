@@ -1,4 +1,4 @@
-import { chatJSON, FAST_MODEL } from './ai.js';
+import { chatJSON, parseJSON, claudeResearchJSON, FAST_MODEL, useClaude } from './ai.js';
 import { YosouFlow, startJob, jobStatus, activeJobs, pushPublicKey, saveSubscription, latestNotice } from './flow.js';
 export { YosouFlow };
 import { BET_TYPES, buildBets, settle, comboKey, judge } from './bets.js';
@@ -79,6 +79,26 @@ export async function saveRace(env, id, fields) {
     .run();
 }
 
+// ---------- 画像の保存 ----------
+// 縦長の出馬表は、アプリ側で数頭ずつの帯（parts）に切って送られてくる。表示用の元画像と帯を両方保存する
+const IMG_RE = /^data:image\/(png|jpeg|webp);base64,/;
+async function storeImage(env, raceId, im) {
+  const dataUrl = String(im?.dataUrl || '');
+  if (!IMG_RE.test(dataUrl)) return { error: '画像形式が正しくありません' };
+  if (dataUrl.length > 8_000_000) return { error: '画像が大きすぎます' };
+  const parts = (Array.isArray(im.parts) ? im.parts : []).slice(0, 12).map(String);
+  if (parts.some((p) => !IMG_RE.test(p) || p.length > 4_000_000)) return { error: '画像形式が正しくありません' };
+  const key = `img:${raceId}:${crypto.randomUUID()}`;
+  await env.IMAGES.put(key, dataUrl);
+  const partKeys = [];
+  for (const [i, p] of parts.entries()) {
+    const k = `${key}:p${i + 1}`;
+    await env.IMAGES.put(k, p);
+    partKeys.push(k);
+  }
+  return { key, name: String(im.name || '画像').slice(0, 80), ...(partKeys.length ? { parts: partKeys } : {}) };
+}
+
 // ---------- 読み取り ----------
 const COURSES = ['札幌', '函館', '福島', '新潟', '東京', '中山', '中京', '京都', '阪神', '小倉'];
 export function raceKey(info = {}) {
@@ -102,31 +122,147 @@ const READ_SYSTEM = `あなたはJRA公式サイトの出馬表（馬柱）を�
 }
 近走は新しい順に最大4走。写っていない項目は null。`;
 
+// 画像は数頭ずつの帯に切って読む。出力を短くするため1頭を配列で表す
+const READ_STRIP_SYSTEM = `あなたはJRA公式の出馬表（馬柱）画像を書き写す担当です。画像は縦に長い出馬表を横方向に切り分けた一部です。
+写っている文字だけを書き写し、推測で値を埋めないでください。読めない値は null にしてください。
+上端または下端で切れていて、その馬の行が途中までしか写っていない馬は書き写さないでください。
+
+【表の読み方】
+- 左から 枠・馬番、馬名の欄、単勝オッズ（人気）、馬体重（増減）、性齢・負担重量・騎手、前走・前々走・3走前・4走前。
+- 馬名の欄は上から 馬名／馬主／生産者／調教師（所属）／父／母／母の父。調教師は下線付きで（栗東）（美浦）が付く名前です。
+- 性齢は「牝5/黒鹿」の「牝5」。その下が負担重量（56.0kg）、一番下の下線付きの名前が騎手です。
+- 近走の各マスは上から：日付と競馬場／レース名とグレード／着順（「3着」の数字）と「16頭 11番」「2番人気」／騎手と斤量／距離（「1800芝」は芝1800）とタイム／馬場（良・稍重など）とレーティング・馬体重／通過順と「3F 33.6」（上がり3F）／最下段の馬名と（0.5）（相手と着差）。
+- 「16頭 11番」は頭数と馬番です。人気は「2番人気」の数字です。
+
+【出力】次の形のJSONだけを、改行やインデントを入れずに出力してください。説明文は書かないでください。
+{"race":{"競馬場":"京都","R番号":11,"レース名":null,"クラス":null,"芝ダ":null,"距離":null,"頭数":null,"発走時刻":null},
+ "horses":[
+  [枠番,馬番,"馬名","性齢",斤量,"騎手","調教師",単勝オッズ,人気,馬体重,増減,
+   [["日付YYYY-MM-DD","競馬場","レース名","グレード","芝1800","馬場",頭数,人気,着順,"1:44.9","10-9-11",上がり3F,"0.5","相手の馬名"], …新しい順に最大4走],
+   ["自信がない項目名", …]]
+ ]}
+race は画像に写っている項目だけ埋め、写っていなければ null にしてください（「5回京都4日 11R」なら 競馬場 京都・R番号 11）。
+通過順は数字をハイフンでつなぎます。数値の項目は数値で出力します。`;
+
+const HORSE_KEYS = ['枠番', '馬番', '馬名', '性齢', '斤量', '騎手', '調教師', '単勝オッズ', '人気', '馬体重', '増減'];
+const PAST_KEYS = ['日付', '競馬場', 'レース名', 'クラス', '距離', '馬場', '頭数', '人気', '着順', 'タイム', '通過順', '上がり3F', '着差', '相手'];
+
+const KNOWN_KEYS = new Set([...HORSE_KEYS, '近走', ...PAST_KEYS]);
+
+// 近走の表記ゆれ（「1800芝」「3F 34.3」「10 9 8」など）をそろえる
+export function normalizePast(r) {
+  const o = { ...r };
+  const d = String(o.距離 ?? '').replace(/\s/g, '');
+  const m = d.match(/(芝|ダ|障)\D*(\d{3,4})/) || d.match(/(\d{3,4})\D*(芝|ダ|障)/);
+  if (m) o.距離 = /\d/.test(m[1]) ? `${m[2]}${m[1]}` : `${m[1]}${m[2]}`;
+  if (o.上がり3F != null) {
+    const f = String(o.上がり3F).replace(/^\s*3F\s*/i, '').match(/\d{2}\.\d/);
+    o.上がり3F = f ? Number(f[0]) : null;
+  }
+  if (o.通過順 != null) o.通過順 = String(o.通過順).trim().split(/[\s\-‐－・,]+/).filter((x) => /^\d{1,2}$/.test(x)).join('-') || null;
+  for (const k of ['頭数', '人気', '着順']) if (o[k] != null && !Number.isFinite(Number(o[k]))) o[k] = num(o[k]);
+  return o;
+}
+
+// 配列形式で返ってきた馬を、これまでと同じオブジェクト形式に直す
+const isHorseArr = (a) => Array.isArray(a) && a.length >= 11 && typeof a[2] === 'string' && Number.isFinite(Number(a[1]));
+const isPastList = (a) => Array.isArray(a) && a.length > 0 && a.every(Array.isArray) && !a.some(isHorseArr);
+
+// AI は近走の配列を閉じ忘れ、次の馬を前の馬の中に入れ子で書くことがある。入れ子の馬も1頭ずつ取り出す
+function collectHorseArrs(list, out = [], seen = new Set()) {
+  for (const h of list || []) {
+    if (seen.has(h)) continue;
+    seen.add(h);
+    if (!isHorseArr(h)) {
+      if (Array.isArray(h)) collectHorseArrs(h.filter(isHorseArr), out, seen);
+      continue;
+    }
+    const tail = h.slice(11);
+    const past = tail.find(isPastList) || (Array.isArray(h[11]) ? h[11].filter((r) => Array.isArray(r) && !isHorseArr(r)) : []);
+    const flags = tail.find((a) => Array.isArray(a) && a.every((x) => typeof x === 'string')) || [];
+    out.push([...h.slice(0, 11), past, flags]);
+    // 近走リストの中や後ろに紛れた馬
+    const nested = [...tail.filter(isHorseArr), ...tail.filter(Array.isArray).flatMap((a) => a.filter(isHorseArr))];
+    collectHorseArrs(nested, out, seen);
+  }
+  return out;
+}
+
+export function fromCompact(part) {
+  if (!part || typeof part !== 'object') return null;
+  const list = Array.isArray(part.horses) ? part.horses : [];
+  const objs = list.filter((h) => h && typeof h === 'object' && !Array.isArray(h));
+  const horses = collectHorseArrs(list.filter(Array.isArray)).map((h) => {
+    const o = Object.fromEntries(HORSE_KEYS.map((k, i) => [k, h[i] ?? null]));
+    o.近走 = h[11].map((r) => normalizePast(Object.fromEntries(PAST_KEYS.map((k, i) => [k, r[i] ?? null]))));
+    // 形式が崩れて他の馬のデータが紛れ込むことがあるため、項目名として正しいものだけ残す
+    o.要確認項目 = h[12].map(String).filter((k) => KNOWN_KEYS.has(k));
+    o.要確認 = o.要確認項目.length > 0;
+    return o;
+  });
+  return { race: part.race || {}, horses: [...objs, ...horses] };
+}
+
+// 貼り付けられたテキストが {"race":…,"horses":[…]} 形式なら取り出す（そうでなければ null）
+export function parseStructured(text) {
+  const s = String(text || '');
+  if (!/"horses"\s*:/.test(s)) return null;
+  try {
+    const part = fromCompact(parseJSON(s));
+    return part?.horses?.length ? part : null;
+  } catch {
+    return null;
+  }
+}
+
+const filled = (h) => Object.entries(h).filter(([k, v]) => k !== '近走' && v != null && v !== '').length + (h.近走?.length || 0) * 3;
+
 function mergeRead(parts) {
   const race = {};
-  const map = new Map();
+  const cands = new Map();
   for (const p of parts) {
     for (const [k, v] of Object.entries(p?.race || {})) if (v != null && v !== '' && race[k] == null) race[k] = v;
     for (const h of p?.horses || []) {
       const no = Number(h?.馬番);
       if (!Number.isInteger(no) || no < 1 || no > 18) continue;
-      const cur = map.get(no) || {};
-      const merged = { ...cur };
-      for (const [k, v] of Object.entries(h)) {
-        if (k === '近走') {
-          if ((v?.length || 0) > (cur.近走?.length || 0)) merged.近走 = v.slice(0, 4);
-        } else if (k === '要確認項目') {
-          merged.要確認項目 = [...new Set([...(cur.要確認項目 || []), ...(v || [])])];
-        } else if (k === '要確認') {
-          merged.要確認 = !!(cur.要確認 || v);
-        } else if (v != null && v !== '' && merged[k] == null) merged[k] = v;
-      }
-      merged.馬番 = no;
-      map.set(no, merged);
+      cands.set(no, [...(cands.get(no) || []), { ...h, 馬番: no }]);
     }
   }
-  const horses = [...map.values()].sort((a, b) => a.馬番 - b.馬番);
+  // 同じ馬を複数の画像で読んだときは、いちばん多く読めたものを土台にして、欠けた項目だけ他から補う
+  const horses = [...cands.entries()].map(([no, all]) => {
+    // 馬番の読み違いで別の馬が混ざることがあるため、いちばん多く読まれた馬名の候補だけを使う
+    const nm = (h) => String(h.馬名 || '').replace(/\s/g, '');
+    const count = new Map();
+    for (const h of all) count.set(nm(h), (count.get(nm(h)) || 0) + 1);
+    all.sort((a, b) => (count.get(nm(b)) - count.get(nm(a))) || filled(b) - filled(a));
+    const list = all.filter((h) => nm(h) === nm(all[0]));
+    const merged = { ...list[0] };
+    for (const h of list.slice(1)) {
+      for (const [k, v] of Object.entries(h)) {
+        if (k === '近走') {
+          if ((v?.length || 0) > (merged.近走?.length || 0)) merged.近走 = v.slice(0, 4);
+        } else if (k === '要確認項目') {
+          merged.要確認項目 = [...new Set([...(merged.要確認項目 || []), ...(v || [])])];
+        } else if (k !== '要確認' && v != null && v !== '' && merged[k] == null) merged[k] = v;
+      }
+    }
+    merged.馬番 = no;
+    return merged;
+  }).sort((a, b) => a.馬番 - b.馬番);
   return validate({ race, horses });
+}
+
+// 同時に動かす数を絞って順に処理する（AIの同時実行の上限と待ち時間のバランス）
+async function pool(items, size, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(size, items.length) }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i], i);
+    }
+  }));
+  return out;
 }
 
 function num(v) {
@@ -141,7 +277,7 @@ export function validate(data) {
     const flags = new Set(h.要確認項目 || []);
     const check = (k, ok) => { if (!ok) flags.add(k); };
     check('枠番', Number.isInteger(num(h.枠番)) && num(h.枠番) >= 1 && num(h.枠番) <= 8);
-    check('馬名', typeof h.馬名 === 'string' && h.馬名.trim().length >= 2);
+    check('馬名', typeof h.馬名 === 'string' && h.馬名.trim().length >= 2 && /^[ァ-ヶー・ヴ＝=]+$/.test(h.馬名.trim()));
     check('斤量', num(h.斤量) >= 48 && num(h.斤量) <= 63);
     check('単勝オッズ', num(h.単勝オッズ) >= 1);
     check('人気', Number.isInteger(num(h.人気)) && num(h.人気) >= 1);
@@ -149,7 +285,7 @@ export function validate(data) {
     check('騎手', typeof h.騎手 === 'string' && h.騎手.trim().length >= 1);
     h.要確認項目 = [...flags];
     h.要確認 = flags.size > 0;
-    h.近走 = Array.isArray(h.近走) ? h.近走.slice(0, 4) : [];
+    h.近走 = Array.isArray(h.近走) ? h.近走.slice(0, 4).map((r) => (r && typeof r === 'object' ? normalizePast(r) : r)) : [];
   }
   const n = num(race.頭数) || Math.max(0, ...horses.map((h) => h.馬番));
   const have = new Set(horses.map((h) => h.馬番));
@@ -165,6 +301,14 @@ export async function readRace(env, race, { text }) {
   const hint = race.date && race.course
     ? `参考：このレースは ${race.date} ${race.course} ${race.rnum}R です。`
     : `参考：今日の日付は ${today} です。出馬表に年が書かれていなければ、今日に最も近い年と判断してください。日付・競馬場・R番号は必ず読み取ってください。`;
+  // Claude アプリで書き起こした決まった形式（JSON）なら、AIを使わずにそのまま取り込む
+  const structured = parseStructured(text);
+  if (structured) {
+    const result = mergeRead([structured]);
+    result.errors = [];
+    result.source = 'claude-app';
+    return result;
+  }
   const jobs = [];
   if (text && text.trim()) {
     // 馬番の範囲ごとに並列で読み取り、応答を短くして待ち時間を減らす
@@ -176,21 +320,74 @@ export async function readRace(env, race, { text }) {
           user: `${hint}\n次はJRAサイトの出馬表からコピーしたテキストです。このうち馬番 ${a}〜${b} の馬だけを書き写してください（該当する馬がいなければ horses は空配列）。race は毎回すべて埋めてください。\n\n${text.slice(0, 30000)}`,
           maxTokens: 6000,
           model: env.READ_MODEL || FAST_MODEL,
+          // テキストは無料AIで十分に読める（2026-11-18 の4レースで成功）。Claude はその予備
+          preferFree: true,
         }).catch((e) => { if (/無料枠/.test(e.message)) throw e; errors.push(`テキスト（馬番${a}〜${b}）：${e.message}`); return null; })
       );
     }
   }
-  for (const img of race.images) {
-    jobs.push(
-      env.IMAGES.get(img.key).then((dataUrl) =>
-        dataUrl
-          ? chatJSON(env, { system: READ_SYSTEM, user: `${hint}\nこの画像に写っている全馬を書き写してください。`, images: [dataUrl], maxTokens: 8000 })
-          : null
-      ).catch((e) => { if (/無料枠/.test(e.message)) throw e; errors.push(`${img.name}：${e.message}`); return null; })
-    );
+  // 画像は帯（parts）に切ってあればそれを読む。古い画像は1枚まるごと読む
+  const pieces = race.images.flatMap((img) =>
+    img.parts?.length
+      ? img.parts.map((key, i) => ({ key, label: `${img.name}（${i + 1}/${img.parts.length}）`, strip: true }))
+      : [{ key: img.key, label: img.name, strip: false }]
+  );
+  let quota = null;
+  const readPiece = async (pc, extra = '') => {
+    if (quota) return null;
+    try {
+      const dataUrl = await env.IMAGES.get(pc.key);
+      if (!dataUrl) return null;
+      const out = await chatJSON(env, pc.strip
+        ? { system: READ_STRIP_SYSTEM, user: `${hint}\nこの画像に写っている馬を書き写してください。${extra}`, images: [dataUrl], maxTokens: 3500, retries: 1 }
+        : { system: READ_STRIP_SYSTEM, user: `${hint}\nこの画像に写っている全馬を書き写してください。${extra}`, images: [dataUrl], maxTokens: 9000, retries: 1 });
+      return fromCompact(out);
+    } catch (e) {
+      if (/無料枠/.test(e.message)) quota = e;
+      else errors.push(`${pc.label}：${e.message}`);
+      return null;
+    }
+  };
+  // Claude なら、全画像の帯を1回の依頼でまとめて読む（同じ馬を何度も書き出さずに済み、速くて安い）
+  if (useClaude(env) && pieces.length) {
+    const urls = (await Promise.all(pieces.map((pc) => env.IMAGES.get(pc.key)))).filter(Boolean);
+    const out = urls.length
+      ? await chatJSON(env, {
+          system: READ_STRIP_SYSTEM,
+          user: `${hint}\n${urls.length}枚の画像は、出馬表のスクリーンショットを上から順に、少しずつ重ねながら横方向に切り分けたものです（複数のスクリーンショットが含まれることもあります）。全部の画像を見て、写っている全馬を馬番順に1頭1回ずつ書き写してください。同じ馬が複数の画像に写っていたら、いちばんはっきり写っている画像から書き写してください。`,
+          images: urls, maxTokens: 12000, effort: 'low',
+        })
+      : null;
+    const part = fromCompact(out);
+    if (!part?.horses?.length && !parts.length) throw new Error('出走馬を読み取れませんでした');
+    if (part) parts.push(part);
+    parts.push(...(await Promise.all(jobs)).filter(Boolean));
+    const prev = race.horses;
+    const result = mergeRead(prev ? [prev, ...parts] : parts);
+    result.errors = errors;
+    return result;
   }
-  parts.push(...(await Promise.all(jobs)).filter(Boolean));
-  if (!parts.length) throw new Error(errors[0] || '読み取る画像またはテキストがありません');
+  const imageJob = pool(pieces, 4, (pc) => readPiece(pc));
+  const textParts = (await Promise.all(jobs)).filter(Boolean);
+  const imageParts = await imageJob;
+  parts.push(...textParts, ...imageParts.filter(Boolean));
+
+  // 抜けた馬番があれば、その前後の馬が写っていた帯だけをもう一度読む（最大3枚）
+  if (!quota && pieces.some((p) => p.strip)) {
+    const seen = new Set(parts.flatMap((p) => (p.horses || []).map((h) => Number(h.馬番))));
+    const total = num(parts.find((p) => p.race?.頭数)?.race?.頭数) || Math.max(0, ...seen);
+    const missing = [];
+    for (let i = 1; i <= Math.min(total, 18); i++) if (!seen.has(i)) missing.push(i);
+    if (missing.length) {
+      const near = (p) => (p?.horses || []).some((h) => missing.some((m) => Math.abs(Number(h.馬番) - m) <= 2));
+      const again = pieces.filter((pc, i) => pc.strip && near(imageParts[i])).slice(0, 3);
+      const extra = `\n馬番 ${missing.join('・')} の馬が写っていれば、必ず書き写してください。`;
+      parts.push(...(await pool(again, 3, (pc) => readPiece(pc, extra))).filter(Boolean));
+    }
+  }
+  if (quota && !parts.length) throw quota;
+  if (quota) errors.push(quota.message);
+  if (!parts.some((p) => p.horses?.length)) throw new Error(errors[0] || '読み取る画像またはテキストがありません');
   const prev = race.horses;
   const result = mergeRead(prev ? [prev, ...parts] : parts);
   result.errors = errors;
@@ -200,7 +397,69 @@ export async function readRace(env, race, { text }) {
 // ---------- リサーチ ----------
 const isGrade = (cls) => /G|重賞|Ｇ/.test(cls || '');
 
-export async function doResearch(env, race, { urls = [], memo = '' }) {
+// Claude にネット検索で調べさせるリサーチ（チャットで予想していたときと同じやり方）
+const CONDITION_KEYS = ['日付', 'レース名', 'クラス', '芝ダ', '距離', '回り', '頭数', '発走時刻', '馬場状態'];
+async function doWebResearch(env, race, { urls = [], memo = '' }) {
+  const info = race.horses?.race || {};
+  const names = (race.horses?.horses || []).map((h) => `${h.馬番}${h.馬名 || ''}`).join('・');
+  const extra = [];
+  for (const u of urls.map((x) => String(x).trim()).filter(Boolean).slice(0, 5)) extra.push(await fetchSource(u)); // 利用者が指定したページ
+  const system = `あなたは競馬予想のリサーチ担当です。ネット検索で無料公開の情報を調べ、予想に必要な要点をまとめます。
+有料・会員限定のページは使いません。見つからないことは推測で書かず、その項目は "取得できず" と書いてください。
+各要点の末尾に、根拠にしたページのサイト名を（netkeiba）のように付けてください。日本語の丁寧語で、最後にJSONだけを出力してください。`;
+  const user = `次のレースについて調べてください。
+レース：${race.date || '日付不明'} ${race.course}${race.rnum}R ${info.レース名 || ''}
+今わかっている条件：クラス ${info.クラス || '不明'}／${info.芝ダ || '芝ダ不明'}${info.距離 ? info.距離 + 'm' : '・距離不明'}／回り ${info.回り || '不明'}／馬場 ${info.馬場状態 || '不明'}
+出走馬（馬番と馬名。レースの特定に使ってください）：${names || '不明'}
+当日の馬場メモ（利用者の入力）：${memo || 'なし'}
+
+調べること
+1. このレースの条件（日付・レース名・クラス・芝/ダート・距離・内回り/外回り・頭数・発走時刻・馬場状態）。出走馬の名前が一致するレースかを確かめてください。
+2. 重賞なら過去10年の傾向（人気・脚質・前走ローテ・枠・年齢・血統）。重賞でなければ同じコース・同じクラスの傾向。
+3. コースの特徴（直線の長さ、最初のコーナーまでの距離、有利な脚質と枠）。
+4. 当日の馬場状態と傾向（わかれば）。
+${extra.filter((s) => s.ok).map((s, i) => `\n参考ページ[${i + 1}] ${s.title || ''} ${s.url}\n${s.text.slice(0, 6000)}`).join('')}
+
+出力形式（JSONのみ）：
+{"レース条件":{"日付":"YYYY-MM-DD","レース名":"","クラス":"GⅠ/GⅡ/GⅢ/リステッド/オープン/3勝クラス/2勝クラス/1勝クラス/未勝利/新馬","芝ダ":"芝|ダート|障害","距離":2000,"回り":"内回り|外回り|なし","頭数":18,"発走時刻":"15:40","馬場状態":"良|稍重|重|不良"},
+"過去傾向":["…（サイト名）"],"コース特徴":["…"],"当日馬場":["…"],"その他":["…"],"データ十分":true}
+条件の中で確かめられなかった項目は null にしてください。`;
+  const { json, sources } = await claudeResearchJSON(env, { system, user, maxTokens: 6000, effort: 'medium', maxSearches: 6 });
+  const blank = ['取得できず'];
+  const sec = (k) => {
+    const v = (Array.isArray(json?.[k]) ? json[k] : []).map(String).filter((x) => !/^取得できず/.test(x));
+    return v.length ? v : blank;
+  };
+  const grade = isGrade(json?.レース条件?.クラス || info.クラス);
+  const cond = Object.fromEntries(CONDITION_KEYS.map((k) => [k, json?.レース条件?.[k] ?? null]).filter(([, v]) => v != null && v !== ''));
+  const allSources = [
+    ...extra.filter((s) => s.ok).map((s) => ({ url: s.url, title: s.title || '' })),
+    ...sources.map((s) => ({ ...s, web: true })),
+  ];
+  return {
+    grade,
+    web: true,
+    conditions: cond,
+    sections: {
+      [grade ? '過去10年の傾向' : '同コース・同クラスの傾向']: sec('過去傾向'),
+      コースの特徴: sec('コース特徴'),
+      当日の馬場と傾向: memo ? [...sec('当日馬場').filter((x) => x !== '取得できず'), `利用者メモ：${memo}`] : sec('当日馬場'),
+      その他: sec('その他'),
+    },
+    enough: !!json?.データ十分,
+    memo,
+    sources: allSources.slice(0, 20).map((s, i) => ({ n: i + 1, url: s.url, title: s.title, ok: true, ...(s.web ? { web: true } : {}) }))
+      .concat(extra.filter((s) => !s.ok).map((s) => ({ url: s.url, title: s.title || '', ok: false, reason: s.reason }))),
+    at: now(),
+  };
+}
+
+export async function doResearch(env, race, opts) {
+  if (useClaude(env)) return doWebResearch(env, race, opts);
+  return doFetchResearch(env, race, opts);
+}
+
+async function doFetchResearch(env, race, { urls = [], memo = '' }) {
   const info = race.horses?.race || {};
   const list = [...new Set([courseUrl(race.course), ...urls.map((u) => String(u).trim())].filter(Boolean))].slice(0, 8);
   const sources = [];
@@ -269,8 +528,11 @@ export async function doYosou(env, race, { type, budget, partnerCount }) {
   const system = 'あなたは競馬予想の分析担当です。与えられたデータとルールだけに基づいて評価し、日本語の丁寧語で、JSONのみを出力します。データにない事実を作らないでください。';
 
   // 1) 全頭評価（6頭ずつ並列）
+  // Claude なら全頭を1回でまとめて評価する（馬どうしの比較がぶれない）。無料AIは出力が長いと崩れるので4頭ずつ
+  const claude = useClaude(env);
+  const size = claude ? 18 : 4;
   const groups = [];
-  for (let i = 0; i < data.horses.length; i += 4) groups.push(data.horses.slice(i, i + 4).map((h) => h.馬番));
+  for (let i = 0; i < data.horses.length; i += size) groups.push(data.horses.slice(i, i + size).map((h) => h.馬番));
   const evalPrompt = (nos) => `${base}
 
 馬番 ${nos.join('・')} を評価してください。観点は次の10個で、この順番です。
@@ -278,7 +540,9 @@ ${VIEWPOINTS.map((v, i) => `${i + 1}.${v}：${VIEWPOINT_DESC[i]}`).join('\n')}
 各観点に ◎/○/△/× を付け、25字以内の根拠を書きます。データがない観点は △ にして「データなし」と書きます。
 脚質は通過順から 逃げ/先行/中団/後方 のどれかで判定します。崩れにくさは3着以内の安定感を0〜5で評価します。
 出力：{"evals":[{"馬番":1,"脚質":"先行","印列":"◎○△×○△○△○◎","根拠":["…10個…"],"崩れにくさ":3,"総合":78,"一言":"40字以内"}]}`;
-  const evalParts = await Promise.all(groups.map((g) => chatJSON(env, { system, user: evalPrompt(g), maxTokens: 3500, model: env.EVAL_MODEL || FAST_MODEL }).catch(() => chatJSON(env, { system, user: evalPrompt(g), maxTokens: 3500 }))));
+  const evalParts = claude
+    ? await Promise.all(groups.map((g) => chatJSON(env, { system, user: evalPrompt(g), maxTokens: 12000, effort: 'high' })))
+    : await Promise.all(groups.map((g) => chatJSON(env, { system, user: evalPrompt(g), maxTokens: 3500, model: env.EVAL_MODEL || FAST_MODEL }).catch(() => chatJSON(env, { system, user: evalPrompt(g), maxTokens: 3500 }))));
   const evals = new Map();
   for (const p of evalParts) for (const e of p?.evals || []) if (data.horses.some((h) => h.馬番 === Number(e.馬番))) evals.set(Number(e.馬番), e);
   const evalList = data.horses.map((h) => {
@@ -309,7 +573,7 @@ ${evalList.map((e) => `${e.馬番}番 ${e.馬名}（${e.人気 ?? '?'}人気・$
 "軸":[1],"相手":[2,3],
 "評価を下げた人気馬":[{"馬番":4,"理由":"60字以内"}],
 "不安材料":["…"],"当日確認":["…"],"データ不足":false,"見送り推奨":false,"見送り理由":""}`;
-  const s = await chatJSON(env, { system, user: sumPrompt, maxTokens: 3000 });
+  const s = await chatJSON(env, { system, user: sumPrompt, maxTokens: 3000, effort: claude ? 'high' : undefined });
 
   const valid = new Set(data.horses.map((h) => h.馬番));
   const ok = (n) => valid.has(Number(n));
@@ -517,11 +781,9 @@ async function api(req, env, path) {
     const id = 'r' + crypto.randomUUID().replace(/-/g, '').slice(0, 10);
     const imgs = [];
     for (const im of images) {
-      const dataUrl = String(im.dataUrl || '');
-      if (!/^data:image\/(png|jpeg|webp);base64,/.test(dataUrl) || dataUrl.length > 8_000_000) return fail('画像形式が正しくありません');
-      const key = `img:${id}:${crypto.randomUUID()}`;
-      await env.IMAGES.put(key, dataUrl);
-      imgs.push({ key, name: String(im.name || '画像').slice(0, 80) });
+      const saved = await storeImage(env, id, im);
+      if (saved.error) return fail(saved.error);
+      imgs.push(saved);
     }
     await env.DB.prepare('INSERT INTO races (id, date, course, rnum, race_name, status, images, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)')
       .bind(id, '', '', 0, '', 'new', JSON.stringify(imgs), now(), now()).run();
@@ -603,7 +865,7 @@ async function api(req, env, path) {
 
   if (!sub && method === 'GET') return json({ race, rulesDefaults: null });
   if (!sub && method === 'DELETE') {
-    await Promise.all(race.images.map((i) => env.IMAGES.delete(i.key)));
+    await Promise.all(race.images.flatMap((i) => [i.key, ...(i.parts || [])]).map((k) => env.IMAGES.delete(k)));
     await env.DB.batch([
       env.DB.prepare('DELETE FROM races WHERE id = ?').bind(id),
       env.DB.prepare('DELETE FROM log WHERE race_id = ?').bind(id),
@@ -623,13 +885,10 @@ async function api(req, env, path) {
     return json({ job });
   }
   if (sub === 'images' && method === 'POST') {
-    const dataUrl = String(body.dataUrl || '');
-    if (!/^data:image\/(png|jpeg|webp);base64,/.test(dataUrl)) return fail('画像形式が正しくありません');
-    if (dataUrl.length > 8_000_000) return fail('画像が大きすぎます');
     if (race.images.length >= 8) return fail('画像は8枚までです');
-    const key = `img:${id}:${crypto.randomUUID()}`;
-    await env.IMAGES.put(key, dataUrl);
-    const images = [...race.images, { key, name: String(body.name || '画像').slice(0, 80) }];
+    const saved = await storeImage(env, id, body);
+    if (saved.error) return fail(saved.error);
+    const images = [...race.images, saved];
     await saveRace(env, id, { images });
     return json({ images });
   }
@@ -638,7 +897,8 @@ async function api(req, env, path) {
     const key = decodeURIComponent(m[1]);
     if (!race.images.some((i) => i.key === key)) return fail('画像が見つかりません', 404);
     if (method === 'DELETE') {
-      await env.IMAGES.delete(key);
+      const img = race.images.find((i) => i.key === key);
+      await Promise.all([key, ...(img.parts || [])].map((k) => env.IMAGES.delete(k)));
       const images = race.images.filter((i) => i.key !== key);
       await saveRace(env, id, { images });
       return json({ images });

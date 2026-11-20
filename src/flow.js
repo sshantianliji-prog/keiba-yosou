@@ -86,6 +86,12 @@ export class YosouFlow extends WorkflowEntrypoint {
             const text = (await env.IMAGES.get(`text:${jobId}`)) || '';
             const result = await readRace(env, { ...race, horses: null }, { text });
             const key = raceKey(result.race);
+            // JRA アプリの出馬表には日付が出ない（「5回京都4日 11R」のみ）。競馬場とR番号が読めていれば今日の日付とみなす
+            if (!key.date && key.course && key.rnum) {
+              key.date = new Date(Date.now() + 9 * 3600e3).toISOString().slice(0, 10);
+              result.race.日付 = key.date;
+              result.race.日付推定 = true; // リサーチで本当の日付がわかれば置き換える
+            }
             const problems = [];
             if (!result.horses.length) problems.push('出走馬を読み取れませんでした');
             if (!key.date || !key.course || !key.rnum) problems.push('日付・競馬場・R番号を判別できませんでした');
@@ -99,10 +105,30 @@ export class YosouFlow extends WorkflowEntrypoint {
             if (problems.length) res = { stop: true, message: problems.join('。') + '。確認画面で修正してください。' };
           } else if (st === 'research') {
             const prev = race.research;
-            const urls = (prev?.sources || []).filter((s) => !/jra\.go\.jp\/facilities/.test(s.url)).map((s) => s.url);
+            // 利用者が指定したページだけを引き継ぐ（検索で見つけたページやJRAのコース紹介は毎回取り直す）
+            const urls = (prev?.sources || []).filter((s) => !s.web && !/jra\.go\.jp\/facilities/.test(s.url)).map((s) => s.url);
             const research = await doResearch(env, race, { urls, memo: prev?.memo || '' });
-            await saveRace(env, raceId, { research, status: 'researched' });
+            // 検索でわかったレース条件で、空欄（と推定の日付）を埋める
+            const fields = {};
+            const cond = research.conditions || {};
+            if (race.horses && Object.keys(cond).length) {
+              const info = { ...(race.horses.race || {}) };
+              for (const [k, v] of Object.entries(cond)) {
+                if (k === '日付') {
+                  if ((info.日付推定 || !info.日付) && /^\d{4}-\d{2}-\d{2}$/.test(String(v))) { info.日付 = v; delete info.日付推定; fields.date = v; }
+                } else if (info[k] == null || info[k] === '') info[k] = v;
+              }
+              fields.horses = { ...race.horses, race: info };
+              if (info.レース名 && !race.race_name) fields.race_name = info.レース名;
+            }
+            await saveRace(env, raceId, { research, status: 'researched', ...fields });
           } else if (st === 'yosou') {
+            // レースの条件が分からないまま予想すると、距離適性・コース・展開の評価がすべて当て推量になるため止める
+            const info = race.horses?.race || {};
+            const lack = [['クラス', info.クラス], ['芝・ダート', info.芝ダ], ['距離', info.距離]].filter(([, v]) => v == null || v === '').map(([k]) => k);
+            if (lack.length) {
+              return { stop: true, message: `レースの条件（${lack.join('・')}）がわかりません。確認画面の「レース情報」に入力してから、もう一度予想してください。` };
+            }
             const yosou = await doYosou(env, race, { type, budget, partnerCount });
             yosou.markdown = yosouMarkdown(race, yosou);
             await saveRace(env, raceId, { yosou, status: 'predicted' });
